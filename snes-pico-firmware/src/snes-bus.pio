@@ -1,0 +1,188 @@
+; SNES bus capture programs for RP2350B -- pinout v0.2
+;
+; Captura "one-shot": UMA palavra por ciclo de escrita, amostrada num ponto
+; fixo dentro da janela de dado valido, re-armando so depois do strobe subir.
+; (A v0.1 herdava o flood-sampling do NES -- 7-9 palavras por escrita -- que
+; saturava o consumer no core1 e impedia parear os streams dos dois PIOs.)
+;
+; Janelas de GPIO:
+;   PIO0: gpio_base = 0,  in_base = 0   -> ve GPIO 0..31
+;   PIO1: gpio_base = 16, in_base = 16  -> ve GPIO 16..47
+;         (main.c PRECISA chamar pio_set_gpio_base(pio1, 16) antes de
+;          pio_add_program -- sem isso o PIO1 nao enxerga GPIO >= 32)
+;
+; Sinais compartilhados vivem na janela de overlap GPIO 16..31:
+;   GPIO 25: PHI2      (PIO0 pin 25 / PIO1 pin  9)
+;   GPIO 26: /WR       (PIO0 pin 26 / PIO1 pin 10)
+;   GPIO 27: /WRAM     (PIO0 pin 27 / PIO1 pin 11)
+;   GPIO 28: /CART     (PIO0 pin 28 / PIO1 pin 12)
+;   GPIO 31: /PAWR     (PIO0 pin 31 / PIO1 pin 15)
+;
+; IMPORTANTE: as sequencias de `wait` nao sao atomicas -- entre um wait e o
+; proximo o barramento pode mudar (ex.: /WRAM sobe e /WR desce para uma
+; escrita em outra regiao). O CONSUMER valida os bits de controle capturados
+; na propria palavra e descarta falsos gatilhos. O PIO e' so o trigger bruto.
+;
+; Delays de amostragem (@ 200 MHz sys_clk, 5 ns/ciclo, +2 ciclos de
+; sincronizador de entrada):
+;   [24] apos PHI2 subir ~ 130 ns -- escrita WRAM (ciclo slow, PHI2 high
+;        ~186 ns): dado do 65816 ja estavel, folga antes do strobe subir.
+;   [18] ~ 100 ns -- escrita cart (pode ser ciclo fast, PHI2 high ~140 ns)
+;        e strobe /PAWR do B-bus.
+; CALIBRAR NO BRING-UP com osciloscopio (fase 5). Se mudar o sys_clk,
+; recalcular.
+
+; =============================================================================
+; PIO0 SM0: escrita na WRAM via A-bus
+; =============================================================================
+.program snesBusWram
+
+.wrap_target
+    wait 1 pin 26        ; /WR high  -> fim da escrita anterior (re-arma)
+    wait 0 pin 27        ; /WRAM low -> CPU enderecando work RAM
+    wait 0 pin 26        ; /WR low   -> e' uma escrita
+    wait 1 pin 25 [24]   ; PHI2 high + delay ate a janela de dado valido
+    in pins 32           ; 1 palavra por escrita (autopush)
+.wrap
+
+
+; =============================================================================
+; PIO0 SM1: escrita no espaco do cartucho (SRAM) via A-bus
+; =============================================================================
+.program snesBusCart
+
+.wrap_target
+    wait 1 pin 26        ; /WR high  -> re-arma
+    wait 0 pin 28        ; /CART low -> espaco do cartucho
+    wait 0 pin 26        ; /WR low
+    wait 1 pin 25 [18]   ; delay menor: ciclo pode ser fast (~140 ns)
+    in pins 32
+.wrap
+
+
+; =============================================================================
+; PIO0 SM2: escrita fora da WRAM (SRAM de HiROM)
+; =============================================================================
+;
+; Em HiROM, a SRAM vive em $30-3F/$B0-BF:6000-7FFF e o /ROMSEL (/CART) NAO
+; asserta nessa janela (A15=0) -- confirmado em hardware com FF6 (cart
+; commits=0 durante saves). Este SM captura escritas com /WRAM INATIVO;
+; o consumer filtra offset $6000-7FFF e so comita quando o cart e' HiROM.
+; Trafego: registradores $2100-$43FF (filtrados por offset) + SRAM --
+; taxa de CPU, sem rajadas de DMA.
+.program snesBusHiSram
+
+.wrap_target
+    wait 1 pin 26        ; /WR high  -> re-arma
+    wait 1 pin 27        ; /WRAM high -> fora da work RAM
+    wait 0 pin 26        ; /WR low   -> escrita
+    wait 1 pin 25 [18]   ; PHI2 high + delay (janela igual a do cart)
+    in pins 32
+.wrap
+
+
+; =============================================================================
+; PIO1 SM0: strobe de escrita do B-bus (/PAWR) -- porta WRAM $2180-$2183
+; =============================================================================
+;
+; O consumer filtra PA7=1 (no B-bus, PA7=1 so ocorre em $2180-83) e decodifica
+; PA1:PA0 para atualizar o ponteiro ($2181-83) ou gravar o dado ($2180) no
+; espelho de WRAM. E' assim que escritas via DMA->$2180 (invisiveis no A-bus)
+; entram no espelho.
+;
+; Pinos relativos ao gpio_base=16: /PAWR = GPIO31 -> pin 15.
+.program snesBusBport
+
+.wrap_target
+    wait 1 pin 15        ; /PAWR high -> fim do strobe anterior
+    wait 0 pin 15 [18]   ; /PAWR low + delay ate o dado estabilizar
+    in pins 32
+.wrap
+
+
+; =============================================================================
+; PIO1 SM1: escrita no cart com A17-A23 (fase 4b -- SRAM grande, bancada)
+; =============================================================================
+;
+; MESMA sequencia de espera e MESMO delay do snesBusCart, nos mesmos sinais
+; fisicos -- os dois SMs emitem exatamente 1 palavra por escrita no cart e os
+; streams podem ser pareados 1:1 (PIO0 da A0-A16, PIO1 da A17-A23).
+; Pinos relativos: /WR=10, /CART=12, PHI2=9.
+.program snesBusCartHigh
+
+.wrap_target
+    wait 1 pin 10        ; /WR high
+    wait 0 pin 12        ; /CART low
+    wait 0 pin 10        ; /WR low
+    wait 1 pin 9 [18]    ; delay IDENTICO ao snesBusCart
+    in pins 32
+.wrap
+
+
+; =============================================================================
+; C-SDK init helpers
+; =============================================================================
+% c-sdk {
+
+#include "hardware/clocks.h"
+
+/**
+ * Config comum: shift right, autopush 32, RX FIFO joined (8 deep), pins de
+ * entrada a partir de in_base ABSOLUTO (o SDK subtrai o gpio_base do PIO).
+ *
+ * Nao chamamos pio_gpio_init(): os pinos ficam como inputs do SIO (gpio_init
+ * feito pelo main) e o PIO le os sincronizadores de entrada de qualquer
+ * funcao -- captura nao exige ownership do pino. Isso tambem deixa o core0
+ * livre para dirigir os mesmos pinos durante o cart-ID.
+ */
+static inline void snes_capture_sm_init(PIO pio, uint sm, uint offset,
+                                        uint in_base, float div,
+                                        const pio_program_t *prog,
+                                        pio_sm_config (*get_cfg)(uint)) {
+    pio_sm_config c = get_cfg(offset);
+    (void)prog;
+    sm_config_set_clkdiv(&c, div);
+    sm_config_set_in_pins(&c, in_base);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_in_shift(&c, true, true, 0);   // shift right, autopush 32
+    pio_sm_init(pio, sm, offset, &c);
+
+    // BUGFIX (2026-07-11): com gpio_base=16 no PIO1, o IN_BASE ficou 16
+    // RELATIVO (= GPIO32) apos o pio_sm_init -- a traducao absoluto->
+    // relativo do SDK nao se aplicou, e `wait pin 15` passou a vigiar o
+    // GPIO47 (UART RX!) em vez do GPIO31 (/PAWR). Sintoma: stream do
+    // B-bus capturava bytes do UART (teto ~65k palavras/sessao) e nunca
+    // via as rajadas de DMA. Forca o IN_BASE fisico correto na marra:
+    hw_write_masked(&pio->sm[sm].pinctrl,
+        (uint32_t)(in_base - pio_get_gpio_base(pio))
+            << PIO_SM0_PINCTRL_IN_BASE_LSB,
+        PIO_SM0_PINCTRL_IN_BASE_BITS);
+}
+
+static inline void snesBusWram_program_init(PIO pio, uint sm, uint offset, float div) {
+    snes_capture_sm_init(pio, sm, offset, 0, div,
+                         &snesBusWram_program, snesBusWram_program_get_default_config);
+}
+
+static inline void snesBusCart_program_init(PIO pio, uint sm, uint offset, float div) {
+    snes_capture_sm_init(pio, sm, offset, 0, div,
+                         &snesBusCart_program, snesBusCart_program_get_default_config);
+}
+
+static inline void snesBusHiSram_program_init(PIO pio, uint sm, uint offset, float div) {
+    snes_capture_sm_init(pio, sm, offset, 0, div,
+                         &snesBusHiSram_program, snesBusHiSram_program_get_default_config);
+}
+
+/** PIO1: exige pio_set_gpio_base(pio, 16) ANTES de pio_add_program(). */
+static inline void snesBusBport_program_init(PIO pio, uint sm, uint offset, float div) {
+    snes_capture_sm_init(pio, sm, offset, 16, div,
+                         &snesBusBport_program, snesBusBport_program_get_default_config);
+}
+
+static inline void snesBusCartHigh_program_init(PIO pio, uint sm, uint offset, float div) {
+    snes_capture_sm_init(pio, sm, offset, 16, div,
+                         &snesBusCartHigh_program, snesBusCartHigh_program_get_default_config);
+}
+
+%}
