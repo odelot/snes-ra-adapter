@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <malloc.h>
 
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
@@ -39,6 +40,8 @@
 #include "hardware/gpio.h"
 #include "hardware/vreg.h"
 #include "hardware/watchdog.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 
 #include "snes-bus.pio.h"
 
@@ -766,42 +769,93 @@ static void cart_compute_md5(bool is_hirom, uint32_t rom_size_bytes,
 // nos pontos do slot embaixo do console, Pico alimentado pelo USB, GND comum.
 // Neste modo o firmware NUNCA dirige nenhum pino do barramento (nao ha
 // switches para isolar e o console esta vivo!): o cart-ID vira um stub que
-// preenche cart_info com os valores chumbados abaixo, e a captura ja arma
-// no boot. Descomente e preencha com o MD5 (hash RA) do jogo plugado:
+// preenche cart_info a partir da TABELA de jogos abaixo. O jogo ativo e'
+// trocado SEM reflash: comando GAME=<n> (USB serial ou pagina /game do
+// ESP32) grava o indice e reinicia. Persistencia no ultimo setor da flash.
+// Comente SNIFF_ONLY_MODE para voltar ao cart-ID real (fase 5).
 //
-#define SNIFF_ONLY_MD5     "544311e104805e926083acf29ec664da"  // Final Fantasy III (J)
-#define SNIFF_ONLY_HIROM   1    // FF3/FF6j = HiROM (estreia do branch HiROM!)
-#define SNIFF_ONLY_SRAM_KB 8    // 8 KB de SRAM (saves) -- set USA 0x02xxxx
-#define SNIFF_ONLY_NTSC    1    // Japao = NTSC
+#define SNIFF_ONLY_MODE 1
 
-#ifdef SNIFF_ONLY_MD5
-#ifndef SNIFF_ONLY_HIROM
-#define SNIFF_ONLY_HIROM 0
-#endif
-#ifndef SNIFF_ONLY_SRAM_KB
-#define SNIFF_ONLY_SRAM_KB 0
-#endif
-#ifndef SNIFF_ONLY_NTSC
-#define SNIFF_ONLY_NTSC 1
-#endif
+#ifdef SNIFF_ONLY_MODE
+
+typedef struct {
+    const char *name;      // vai no cart_info.title (max 21 chars, sem ';')
+    const char *md5;       // hash RA da ROM, 32 hex
+    uint8_t     is_hirom;
+    uint16_t    sram_kb;   // janela de SRAM espelhada (LoROM $70 / HiROM $3x:6-7FFF)
+    uint8_t     is_ntsc;
+} sniff_game_t;
+
+// ATENCAO: a pagina /game do snes-esp-firmware.ino duplica esta lista
+// (nomes+indices) -- mantenha as duas em sincronia ao editar.
+static const sniff_game_t sniff_games[] = {
+    { "Super Mario World",     "cdd3c8c37322978ca8669b34bc89c804", 0,  2, 1 },
+    { "Street Fighter II",     "be7fc84ac1151b99ad48329327e2aaa7", 0,  0, 1 },
+    { "Final Fantasy III (J)", "544311e104805e926083acf29ec664da", 1,  8, 1 },
+    { "Yoshi's Island",        "cb472164c5a71ccd3739963390ec6a50", 0, 32, 1 },
+    { "Star Fox",              "9dce6a9dcbe4e304d67b9e8fd8999e7e", 0, 32, 1 },
+    { "Mega Man X",            "df1cc0c8c8c4b61e3b834cc03366611c", 0,  0, 1 },
+    { "Super Castlevania IV",  "094f035993e9724647b61ddcba1e9a7a", 0,  0, 1 },
+    { "EarthBound",            "a864b2e5c141d2dec1c4cbed75a42a85", 1,  8, 1 },
+    { "Zelda: Link to Past",   "608c22b8ff930c62dc2de54bcd6eba72", 0,  8, 1 },
+    { "Super Punch-Out!!",     "97fe7d7d2a1017f8480e60a365a373f0", 0,  8, 1 },
+    { "Super Mario Kart",      "7f25ce5a283d902694c52fb1152fa61a", 0,  2, 1 },
+};
+#define SNIFF_GAME_COUNT   (sizeof(sniff_games) / sizeof(sniff_games[0]))
+#define SNIFF_GAME_DEFAULT 4u   // usado so' quando a flash ainda esta virgem
+
+static uint8_t sniff_active_game = SNIFF_GAME_DEFAULT;
+
+// Persistencia do indice: ultimo setor da flash (o RP2350 nao tem EEPROM).
+// Escrever flash com o core1 capturando (codigo XIP) = hardfault; por isso
+// GAME=<n> apenas deixa o pedido no scratch do watchdog (sobrevive ao reboot,
+// nao a power-off) e reinicia -- game_slot_boot_init() persiste na flash no
+// comeco do boot, quando so o core0 existe. scratch[4..7] sao do bootrom/
+// watchdog_reboot; usamos [0]/[1].
+#define GAME_SLOT_MAGIC     0x534E4946u   // "SNIF"
+#define GAME_SLOT_FLASH_OFF (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+
+static void game_slot_boot_init(void) {
+    if (watchdog_hw->scratch[0] == GAME_SLOT_MAGIC &&
+        watchdog_hw->scratch[1] < SNIFF_GAME_COUNT) {
+        uint8_t idx = (uint8_t)watchdog_hw->scratch[1];
+        watchdog_hw->scratch[0] = 0;
+        uint8_t page[FLASH_PAGE_SIZE];
+        memset(page, 0xFF, sizeof(page));
+        page[0] = 'S'; page[1] = 'N'; page[2] = 'I'; page[3] = 'F';
+        page[4] = idx;
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(GAME_SLOT_FLASH_OFF, FLASH_SECTOR_SIZE);
+        flash_range_program(GAME_SLOT_FLASH_OFF, page, FLASH_PAGE_SIZE);
+        restore_interrupts(ints);
+    }
+    const uint8_t *p = (const uint8_t *)(XIP_BASE + GAME_SLOT_FLASH_OFF);
+    if (p[0] == 'S' && p[1] == 'N' && p[2] == 'I' && p[3] == 'F' &&
+        p[4] < SNIFF_GAME_COUNT) {
+        sniff_active_game = p[4];
+    }
+}
 
 static void sniff_fill_cart_info(void) {
-    memset(&cart_info, 0, sizeof(cart_info));
-    strcpy(cart_info.title, "SNIFF-ONLY");
-    cart_info.header_valid    = true;
-    cart_info.is_hirom        = (SNIFF_ONLY_HIROM) != 0;
-    cart_info.is_ntsc         = (SNIFF_ONLY_NTSC) != 0;
-    cart_info.sram_size_bytes = (uint32_t)(SNIFF_ONLY_SRAM_KB) * 1024u;
+    const sniff_game_t *g = &sniff_games[sniff_active_game];
 
-    // MD5 chumbado: string hex -> bytes
-    const char *h = SNIFF_ONLY_MD5;
+    memset(&cart_info, 0, sizeof(cart_info));
+    strncpy(cart_info.title, g->name, 21);
+    cart_info.title[21]       = '\0';
+    cart_info.header_valid    = true;
+    cart_info.is_hirom        = g->is_hirom != 0;
+    cart_info.is_ntsc         = g->is_ntsc != 0;
+    cart_info.sram_size_bytes = (uint32_t)g->sram_kb * 1024u;
+
+    // MD5 da tabela: string hex -> bytes
     for (int i = 0; i < 16; i++) {
-        char b[3] = { h[i * 2], h[i * 2 + 1], '\0' };
+        char b[3] = { g->md5[i * 2], g->md5[i * 2 + 1], '\0' };
         cart_info.md5[i] = (uint8_t)strtol(b, NULL, 16);
     }
-    printf("SNIFF-ONLY: %s SRAM=%luKB md5=%s\n",
+    printf("SNIFF-ONLY [%u] %s: %s SRAM=%luKB md5=%s\n",
+           (unsigned)sniff_active_game, g->name,
            cart_info.is_hirom ? "HiROM" : "LoROM",
-           (unsigned long)(cart_info.sram_size_bytes / 1024), h);
+           (unsigned long)(cart_info.sram_size_bytes / 1024), g->md5);
 }
 #endif
 
@@ -813,7 +867,7 @@ static void sniff_fill_cart_info(void) {
  * Returns true if a valid SNES header was found.
  */
 static bool cart_id_phase(void) {
-#ifdef SNIFF_ONLY_MD5
+#ifdef SNIFF_ONLY_MODE
     // Sniff-only: NAO tocar no barramento. cart_info ja foi preenchida no
     // boot; so reafirma para o caso de um READ_CART repetido.
     sniff_fill_cart_info();
@@ -901,7 +955,7 @@ static bool cart_id_phase(void) {
 
     cart_drive_bus_release();
     return true;
-#endif  // SNIFF_ONLY_MD5
+#endif  // SNIFF_ONLY_MODE
 }
 
 /**
@@ -949,10 +1003,61 @@ static void release_snes(void) {
 //     RESET                              force Pico reboot via watchdog
 
 #define BAUD_RATE          115200
-#define SERIAL_BUFFER_SIZE 65536
+
+// Fase A: 96KB estaticos p/ o payload do patch. Orcamento (520KB total):
+// espelhos 160K + serial 96K + rings ~30K = BSS ~292K, sobrando ~215K de
+// heap p/ o parse do rcheevos -- protegido pelo filter_large_memaddr()
+// (ideia do NES v1.3, com stub corrigido: "1=0" nunca-verdadeiro; o "0=0"
+// original do NES e' SEMPRE-verdadeiro e daria award falso em hardcore!).
+#define SERIAL_BUFFER_SIZE 98304
 
 static uint8_t serial_buffer[SERIAL_BUFFER_SIZE];
 static uint8_t *serial_buffer_head = serial_buffer;
+
+// Triggers com MemAddr acima disso sao stubados para "1=0" antes do parse
+// (aparecem na lista, nunca disparam). 4KB corta os 8 "monstros" do SMW
+// (4.8-9.6KB de logica cada, ~150KB+ de heap se parseados) e preserva
+// todo o resto.
+#define MAX_MEMADDR_LEN 4096
+
+/**
+ * Varre o JSON do patch e substitui valores de "MemAddr" maiores que
+ * MAX_MEMADDR_LEN por "1=0", deslocando o restante in-place.
+ * Retorna o novo tamanho (string continua NUL-terminada).
+ */
+static size_t filter_large_memaddr(char *json, size_t len) {
+    const char  *needle = "\"MemAddr\":\"";
+    const size_t needle_len = 11;
+    char *pos = json;
+
+    for (;;) {
+        char *found = strstr(pos, needle);
+        if (!found) break;
+
+        char *v_start  = found + needle_len;
+        char *v_end    = v_start;
+        char *json_end = json + len;
+
+        while (v_end < json_end && *v_end != '"') {
+            if (*v_end == '\\') v_end++;    // pula escapes
+            v_end++;
+        }
+        if (v_end >= json_end) break;
+
+        size_t v_len = (size_t)(v_end - v_start);
+        if (v_len > MAX_MEMADDR_LEN) {
+            printf("[filter] MemAddr de %u bytes -> stub 1=0\n",
+                   (unsigned)v_len);
+            memmove(v_start + 3, v_end, (size_t)(json_end - v_end) + 1);
+            memcpy(v_start, "1=0", 3);
+            len -= (v_len - 3);
+            pos = v_start + 4;
+        } else {
+            pos = v_end + 1;
+        }
+    }
+    return len;
+}
 
 static inline bool prefix(const char *pre, const char *str) {
     return strncmp(pre, str, strlen(pre)) == 0;
@@ -1407,14 +1512,33 @@ static void handle_resp(const char *cmd) {
 
     if (request_ongoing) request_ongoing--;
 
+    size_t body_len = strlen(p);
+
     // Telemetria de bring-up: tamanho do corpo recebido (truncamento de
     // payload grande aparece aqui na hora).
-    printf("[resp] id=%02X http=%u len=%u\n", id, http, (unsigned)strlen(p));
+    printf("[resp] id=%02X http=%u len=%u\n", id, http, (unsigned)body_len);
+
+    // Payload grande = provavelmente o patch: stub-a triggers gigantes
+    // antes do parse (protege a heap) e mede o custo real do rcheevos.
+    bool big = body_len > 8192;
+    if (big) {
+        // o buffer subjacente e' o serial_buffer (mutavel); o const vem
+        // so da assinatura do handler
+        body_len = filter_large_memaddr((char *)p, body_len);
+        struct mallinfo mi = mallinfo();
+        printf("[heap] antes do parse: usado=%d livre=%d\n",
+               mi.uordblks, mi.fordblks);
+    }
 
     for (int i = 0; i < MAX_ASYNC_CALLBACKS; i++) {
         if (async_handlers[i].id == id) {
             async_cb_t copy = async_handlers[i].data;
-            http_callback(http, p, strlen(p), &copy, NULL);
+            http_callback(http, p, body_len, &copy, NULL);
+            if (big) {
+                struct mallinfo mi = mallinfo();
+                printf("[heap] depois do parse: usado=%d livre=%d\n",
+                       mi.uordblks, mi.fordblks);
+            }
             return;
         }
     }
@@ -1997,6 +2121,54 @@ static void debug_dump(void) {
 }
 
 // =============================================================================
+// Deteccao de RESET do console (tap /RESET no GP43)
+// =============================================================================
+//
+// Quando o usuario aperta reset (ou liga o console depois do Pico), o jogo
+// recomeca do zero mas os espelhos e o estado do rcheevos ficam PODRES --
+// hit counts, deltas e valores antigos podem gerar trigger falso. Aqui:
+// /RESET precisa ficar ALTO por 500ms para ARMAR (garante que o fio existe
+// e o console roda -- GP43 flutuando em 0 nunca arma, entao sem o fio a
+// feature fica dormente). Depois de armado, /RESET em 0 por >30ms = reset
+// real -> limpa espelhos, rc_client_reset() (API do rcheevos exatamente
+// para isso: zera hits/estado, preserva unlocks) e avisa o ESP32.
+//
+// Feature que o adaptador NES nao tem ("console RESET detection is not
+// yet implemented" no README de la desde sempre).
+
+static void maybe_detect_console_reset(void) {
+    static uint32_t last_ms, high_ms, low_ms;
+    static bool armed;
+
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now == last_ms) return;                 // amostra ~1x por ms
+    uint32_t dt = now - last_ms;
+    last_ms = now;
+
+    if (gpio_get(SNES_RESET_N)) {
+        high_ms += dt;
+        low_ms = 0;
+        if (!armed && high_ms > 500) {
+            armed = true;
+            printf("[reset] deteccao armada (fio do /RESET presente)\n");
+        }
+    } else {
+        low_ms += dt;
+        high_ms = 0;
+        if (armed && low_ms > 30) {
+            armed = false;                      // re-arma quando voltar a ALTO
+            printf("[reset] console resetado -> espelhos limpos + rc_client_reset\n");
+            mirrors_reset();
+            wm_pointer = 0;
+            if (g_client != NULL && state == 8) {
+                rc_client_reset(g_client);
+            }
+            uart_send("SNES_RESETED\r\n");      // ESP32 redesenha a UI
+        }
+    }
+}
+
+// =============================================================================
 // Banner ao conectar terminal USB
 // =============================================================================
 //
@@ -2017,12 +2189,13 @@ static void maybe_print_usb_banner(void) {
         printf("addr-fix ATIVO: A%d<->A%d destrocados por software\n",
                ADDR_FIX_SWAP_A, ADDR_FIX_SWAP_B);
 #endif
-#ifdef SNIFF_ONLY_MD5
-        printf("modo: SNIFF-ONLY (md5 chumbado, captura armada, nenhum pino dirigido)\n");
-        printf("cart: %s SRAM=%luKB md5=%s\n",
+#ifdef SNIFF_ONLY_MODE
+        printf("modo: SNIFF-ONLY (tabela de jogos, captura armada, nenhum pino dirigido)\n");
+        printf("jogo ativo [%u]: %s (%s, SRAM=%luKB) -- GAME? lista, GAME=<n> troca\n",
+               (unsigned)sniff_active_game,
+               sniff_games[sniff_active_game].name,
                cart_info.is_hirom ? "HiROM" : "LoROM",
-               (unsigned long)(cart_info.sram_size_bytes / 1024),
-               SNIFF_ONLY_MD5);
+               (unsigned long)(cart_info.sram_size_bytes / 1024));
 #else
         printf("modo: normal (isolamento %s) -- aguardando READ_CART\n",
 #ifdef BUS_SWITCH_4066
@@ -2036,7 +2209,8 @@ static void maybe_print_usb_banner(void) {
                (unsigned)state, capture_started ? "ON" : "off",
                (unsigned long)to_ms_since_boot(get_absolute_time()));
         printf("comandos: SYNC | DBG | READ_CART | PEEK=<addr hex> | "
-               "WATCH=<addr hex>|OFF | RESET\n\n");
+               "WATCH=<addr hex>|OFF | VSYNC=ON|OFF | GREP=<addr>|OFF | "
+               "GAME? | GAME=<n> | RESETSNES | RESET\n\n");
     }
     usb_was_connected = now;
 }
@@ -2158,6 +2332,40 @@ static void process_serial_command(char *command) {
     } else if (prefix("DBG", command)) {
         debug_dump();
 
+#ifdef SNIFF_ONLY_MODE
+    } else if (prefix("GAME?", command)) {
+        printf("[game] tabela (GAME=<n> troca, persiste e reinicia):\n");
+        for (uint32_t i = 0; i < SNIFF_GAME_COUNT; i++) {
+            printf("  %lu%c %-22s %s SRAM=%uKB\n",
+                   (unsigned long)i, i == sniff_active_game ? '*' : ' ',
+                   sniff_games[i].name,
+                   sniff_games[i].is_hirom ? "HiROM" : "LoROM",
+                   sniff_games[i].sram_kb);
+        }
+
+    } else if (prefix("GAME=", command)) {
+        uint32_t n = (uint32_t)strtoul(command + 5, NULL, 10);
+        if (n < SNIFF_GAME_COUNT) {
+            printf("[game] trocando para [%lu] %s -- persistindo e reiniciando...\n",
+                   (unsigned long)n, sniff_games[n].name);
+            sleep_ms(50);   // deixa o printf sair antes do reboot
+            watchdog_hw->scratch[0] = GAME_SLOT_MAGIC;
+            watchdog_hw->scratch[1] = n;
+            watchdog_reboot(0, 0, 0);
+        } else {
+            printf("[game] indice invalido (0-%lu)\n",
+                   (unsigned long)(SNIFF_GAME_COUNT - 1));
+        }
+#endif
+
+    } else if (prefix("RESETSNES", command)) {
+        // Reset forcado do CONSOLE via Q1 (GP44 -> R2 -> base). No chicote
+        // sem Q1 e' um no-op inofensivo (GP44 esta no ar).
+        printf("[reset] pulso de reset no console via Q1 (150ms)\n");
+        gpio_put(SNES_RESET_DRIVE, 1);
+        sleep_ms(150);
+        gpio_put(SNES_RESET_DRIVE, 0);
+
     } else if (prefix("RESET", command)) {
         watchdog_reboot(0, 0, 0);
 
@@ -2241,6 +2449,12 @@ int main(void) {
     stdio_init_all();
     setup_uart();
 
+#ifdef SNIFF_ONLY_MODE
+    // Persistencia do jogo ativo: PRECISA rodar antes do core1 nascer --
+    // flash_range_erase com codigo XIP executando no outro core = hardfault.
+    game_slot_boot_init();
+#endif
+
     mirrors_reset();
     ach_fifo_init(&ach_fifo);
 
@@ -2249,11 +2463,11 @@ int main(void) {
     multicore_launch_core1(core1_main);
     sleep_ms(250);    // folga p/ core1 iniciar e bloquear no mutex
 
-#ifdef SNIFF_ONLY_MD5
-    // Sniff-only: cart_info chumbada e captura armada desde o boot -- o
+#ifdef SNIFF_ONLY_MODE
+    // Sniff-only: cart_info vem da tabela e captura armada desde o boot -- o
     // console roda livre (sem switches, sem Q1). PEEK=/WATCH= ja funcionam
     // pelo USB; READ_CART/START_WATCH seguem o fluxo normal com o MD5
-    // chumbado, caso o ESP32 esteja conectado.
+    // da tabela, caso o ESP32 esteja conectado.
     sniff_fill_cart_info();
     start_capture_once();
     printf("[BOOT] SNIFF-ONLY: captura armada, nenhum pino sera dirigido\n");
@@ -2275,6 +2489,7 @@ int main(void) {
         maybe_print_usb_banner();
         maybe_watch();         // WATCH=<addr>: imprime mudancas no espelho
         maybe_grep();          // GREP=<addr>: contadores de captura
+        maybe_detect_console_reset();   // botao de reset do console (GP43)
 
         // ---- Cart-ID phase (gated on ESP32's READ_CART command) ----
         //

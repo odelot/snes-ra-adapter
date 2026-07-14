@@ -62,8 +62,8 @@
  * remember: you need to deploy the lambda and inform its URL
  */
 
-#define ENABLE_SHRINK_LAMBDA 0 // 0 - disable / 1 - enable
-#define SHRINK_LAMBDA_URL "https://XXXXXXXX.execute-api.us-east-1.amazonaws.com/default/XXXXXXXX?"
+#define ENABLE_SHRINK_LAMBDA 1 // 0 - disable / 1 - enable
+#define SHRINK_LAMBDA_URL "https://xxxxxxxxx.execute-api.us-east-1.amazonaws.com/default/NES_RA_ADAPTER?"
 
 /**
  enable internal web app (comment to disable)
@@ -137,7 +137,7 @@
 #define SERIAL_COMM_CHUNK_SIZE 64
 #define SERIAL_COMM_TX_DELAY_MS 2
 
-#define SERIAL_MAX_PICO_BUFFER 61440 // Pico 2 (RP2350) tem buffer de 64KB; margem p/ prefixo RESP=
+#define SERIAL_MAX_PICO_BUFFER 92160 // Fase A: Pico 2 com buffer de 96KB; margem p/ prefixo RESP=
 /**
  * defines for the fifo used to store achievements to be showed on screen
  */
@@ -342,6 +342,77 @@ AsyncWebSocketClient *ws_client = NULL;
 bool websocket_initialized = false;
 #endif
 
+// -----------------------------------------------------------------------------
+// Seletor de jogo do modo sniff do Pico (pagina /game, para trocar do celular)
+// -----------------------------------------------------------------------------
+// Independente do webapp experimental: com ENABLE_INTERNAL_WEB_APP_SUPPORT a
+// rota entra no server principal (em init_websocket); sem ele, sobe um
+// AsyncWebServer minimo so com /game assim que o WiFi conectar.
+// Lista de jogos DUPLICADA da tabela sniff_games[] do
+// snes-pico-firmware/src/main.c -- manter as duas em sincronia.
+
+static uint32_t game_switch_restart_at = 0;  // 0 = nada pendente
+static bool game_selector_started = false;
+
+static const char GAME_MENU_HTML[] PROGMEM =
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>body{font-family:sans-serif;background:#222;color:#eee;text-align:center}"
+    "a{display:block;margin:12px auto;padding:16px;max-width:320px;background:#444;"
+    "color:#fff;text-decoration:none;border-radius:8px;font-size:1.2em}</style>"
+    "<h2>SNES RA &mdash; trocar jogo</h2>"
+    "<a href='/game?n=0'>Super Mario World</a>"
+    "<a href='/game?n=1'>Street Fighter II</a>"
+    "<a href='/game?n=2'>Final Fantasy III (J)</a>"
+    "<a href='/game?n=3'>Yoshi's Island</a>"
+    "<a href='/game?n=4'>Star Fox</a>"
+    "<a href='/game?n=5'>Mega Man X</a>"
+    "<a href='/game?n=6'>Super Castlevania IV</a>"
+    "<a href='/game?n=7'>EarthBound</a>"
+    "<a href='/game?n=8'>Zelda: A Link to the Past</a>"
+    "<a href='/game?n=9'>Super Punch-Out!!</a>"
+    "<a href='/game?n=10'>Super Mario Kart</a>";
+
+static void game_selector_route(AsyncWebServer *srv)
+{
+  srv->on("/game", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("n")) {
+      String n = request->getParam("n")->value();
+      Serial.print(F("GAME SWITCH -> "));
+      Serial.println(n);
+      Serial0.print(F("GAME="));
+      Serial0.print(n);
+      Serial0.print(F("\r\n"));
+      Serial0.flush();
+      request->send(200, "text/html",
+        F("<meta name='viewport' content='width=device-width'>"
+          "<h2>Trocando de jogo...</h2>"
+          "<p>O adaptador vai reiniciar. Recarregue em ~20s.</p>"));
+      game_switch_restart_at = millis() + 500;  // restart no loop(), pos-flush
+    } else {
+      request->send_P(200, "text/html", GAME_MENU_HTML);
+    }
+  });
+}
+
+// Chamado do loop(): no build sem webapp, cria o server minimo quando o WiFi
+// estiver de pe. No build com webapp e' no-op (rota ja vai no server principal).
+static void maybe_start_game_selector()
+{
+#ifndef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  if (game_selector_started || WiFi.status() != WL_CONNECTED)
+    return;
+  AsyncWebServer *srv = new (std::nothrow) AsyncWebServer(80);
+  if (srv == nullptr)
+    return;                     // sem memoria: tenta de novo no proximo loop
+  game_selector_route(srv);
+  srv->begin();
+  game_selector_started = true; // nunca destruimos: vive ate o proximo reboot
+  Serial.print(F("seletor de jogos: http://"));
+  Serial.print(WiFi.localIP());
+  Serial.println(F("/game"));
+#endif
+}
+
 // global variables for the state machine
 DeviceState state = STATE_UNINITIALIZED;
 
@@ -362,7 +433,7 @@ char serial_buffer[SERIAL_BUFFER_SIZE];
 size_t serial_buffer_len = 0;
 
 // Flexible buffer for large HTTP responses 
-#define LARGE_BUFFER_SIZE 102400 // 100 KB 
+#define LARGE_BUFFER_SIZE 64000 // 64 KB 
 #define SMALL_BUFFER_SIZE 10240 // 10 KB
 CharBufferStream response;
 // HTTP client global to reuse SSL buffers (avoids fragmentation)
@@ -898,8 +969,8 @@ void initLCD () {
   tft.fillRoundRect(16, 76, 208, 128, 15, TFT_BLUE);
   tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
 
-  tft.setCursor(75, 220, 2);
-  tft.println("by Odelot & GH");
+  tft.setCursor(60, 220, 2);
+  tft.println("by Odelot & mi213");
 }
 #endif
 
@@ -1879,6 +1950,9 @@ void init_websocket()
   server->serveStatic("/snd.mp3", LittleFS, "/snd.mp3")
       .setCacheControl("max-age=86400");
 
+  // Seletor de jogo (modo sniff): rota /game no server principal
+  game_selector_route(server);
+
   server->addHandler(ws);
   server->begin();
   
@@ -2318,10 +2392,11 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
   if (is_patch_request) {
     // print_memory_stats("BEFORE PATCH REQUEST");
     
-    // Trim trailing spaces and add &f=3
+    // Trim trailing spaces; add &f=3 + orcamento p/ o lambda (Fase A:
+    // o Pico 2 aceita 90KB; NES antigos nao mandam &max e ficam nos 32KB)
     while (data_len > 0 && data[data_len - 1] == ' ') data_len--;
-    strcpy(data + data_len, "&f=3");
-    data_len += 4;
+    strcpy(data + data_len, "&f=3&max=90000");
+    data_len += 14;
     
     
   }
@@ -2834,10 +2909,25 @@ void setup()
   }
 
   delay(1000);
-  
+
+#ifdef ENABLE_LCD
+  // Aloca o decodificador PNG (~48KB contiguos do PNGdec) AGORA, com a
+  // heap fresca de boot -- antes do buffer grande de resposta. Alocar
+  // tarde (em init_websocket, pos-patch) falhava por fragmentacao: o
+  // new(nothrow) retornava nullptr e as imagens sumiam em silencio
+  // (era tambem a causa do abort/reboot antes do nothrow).
+  if (png == nullptr) {
+    png = new (std::nothrow) PNG();
+    if (png == nullptr) {
+      Serial.println(F("PNG decoder alloc FAILED at boot!"));
+    } else {
+      Serial.println(F("PNG decoder allocated at boot"));
+    }
+  }
+#endif
 
   // print_memory_stats("BEFORE LARGE BUFFER ALLOCATION");
-  
+
   if (response.reserve(LARGE_BUFFER_SIZE)) {
     Serial.print(F("Large response buffer allocated: ")); 
     Serial.print(LARGE_BUFFER_SIZE); 
@@ -3092,6 +3182,14 @@ void setup()
 // arduino-esp32 main loop
 void loop()
 {
+  maybe_start_game_selector();
+
+  // Troca de jogo via /game: o Pico ja recebeu GAME=<n> e esta rebootando
+  // com o indice novo; reinicia o ESP32 tambem para ressincronizar do zero.
+  if (game_switch_restart_at != 0 && millis() > game_switch_restart_at)
+  {
+    ESP.restart();
+  }
 
 #ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
   if (websocket_initialized && ws != nullptr) {
