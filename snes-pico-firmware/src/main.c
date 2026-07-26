@@ -635,6 +635,12 @@ typedef struct {
 
 static snes_cart_info_t cart_info;
 
+// SRAM na janela de expansao $6000-7FFF SEM /ROMSEL em cart LoROM (boards
+// DSP tipo SHVC-1K1B; descoberto no SMK 14/jul: save do TT em $66EC-$66FC).
+// Setado pela tabela do modo sniff; abre o gate do consume_hisram_word
+// tambem para LoROM. No cart-ID real (fase 5) vira heuristica de board.
+static bool sram_exp_window = false;
+
 /**
  * Sequentially read N bytes from a contiguous bus address range into dst.
  * Used for header reads only -- the streaming MD5 loop uses cart_read_byte
@@ -792,22 +798,27 @@ typedef struct {
     uint8_t     is_hirom;
     uint16_t    sram_kb;   // janela de SRAM espelhada (LoROM $70 / HiROM $3x:6-7FFF)
     uint8_t     is_ntsc;
+    // Boards LoROM+DSP (SHVC-1K1B, ex. SMK): a SRAM vive na janela de
+    // expansao $6000-7FFF SEM /ROMSEL (igual HiROM), com o DSP nos banks
+    // baixos da MESMA janela. DESCOBERTO no SMK em 14/jul: save do Time
+    // Trial capturado em $66EC-$66FC (sram_off = offset - $6000).
+    uint8_t     exp_sram;
 } sniff_game_t;
 
 // ATENCAO: a pagina /game do snes-esp-firmware.ino duplica esta lista
 // (nomes+indices) -- mantenha as duas em sincronia ao editar.
 static const sniff_game_t sniff_games[] = {
-    { "Super Mario World",     "cdd3c8c37322978ca8669b34bc89c804", 0,  2, 1 },
-    { "Street Fighter II",     "be7fc84ac1151b99ad48329327e2aaa7", 0,  0, 1 },
-    { "Final Fantasy III (J)", "544311e104805e926083acf29ec664da", 1,  8, 1 },
-    { "Yoshi's Island",        "cb472164c5a71ccd3739963390ec6a50", 0, 32, 1 },
-    { "Star Fox",              "9dce6a9dcbe4e304d67b9e8fd8999e7e", 0, 32, 1 },
-    { "Mega Man X",            "df1cc0c8c8c4b61e3b834cc03366611c", 0,  0, 1 },
-    { "Super Castlevania IV",  "094f035993e9724647b61ddcba1e9a7a", 0,  0, 1 },
-    { "EarthBound",            "a864b2e5c141d2dec1c4cbed75a42a85", 1,  8, 1 },
-    { "Zelda: Link to Past",   "608c22b8ff930c62dc2de54bcd6eba72", 0,  8, 1 },
-    { "Super Punch-Out!!",     "97fe7d7d2a1017f8480e60a365a373f0", 0,  8, 1 },
-    { "Super Mario Kart",      "7f25ce5a283d902694c52fb1152fa61a", 0,  2, 1 },
+    { "Super Mario World",     "cdd3c8c37322978ca8669b34bc89c804", 0,  2, 1, 0 },
+    { "Street Fighter II",     "be7fc84ac1151b99ad48329327e2aaa7", 0,  0, 1, 0 },
+    { "Final Fantasy III (J)", "544311e104805e926083acf29ec664da", 1,  8, 1, 0 },
+    { "Yoshi's Island",        "cb472164c5a71ccd3739963390ec6a50", 0, 32, 1, 0 },
+    { "Star Fox",              "9dce6a9dcbe4e304d67b9e8fd8999e7e", 0, 32, 1, 0 },
+    { "Mega Man X",            "df1cc0c8c8c4b61e3b834cc03366611c", 0,  0, 1, 0 },
+    { "Super Castlevania IV",  "094f035993e9724647b61ddcba1e9a7a", 0,  0, 1, 0 },
+    { "EarthBound",            "a864b2e5c141d2dec1c4cbed75a42a85", 1,  8, 1, 0 },
+    { "Zelda: Link to Past",   "608c22b8ff930c62dc2de54bcd6eba72", 0,  8, 1, 0 },
+    { "Super Punch-Out!!",     "97fe7d7d2a1017f8480e60a365a373f0", 0,  8, 1, 0 },
+    { "Super Mario Kart",      "7f25ce5a283d902694c52fb1152fa61a", 0,  2, 1, 1 },
 };
 #define SNIFF_GAME_COUNT   (sizeof(sniff_games) / sizeof(sniff_games[0]))
 #define SNIFF_GAME_DEFAULT 4u   // usado so' quando a flash ainda esta virgem
@@ -854,6 +865,7 @@ static void sniff_fill_cart_info(void) {
     cart_info.is_hirom        = g->is_hirom != 0;
     cart_info.is_ntsc         = g->is_ntsc != 0;
     cart_info.sram_size_bytes = (uint32_t)g->sram_kb * 1024u;
+    sram_exp_window           = g->exp_sram != 0;
 
     // MD5 da tabela: string hex -> bytes
     for (int i = 0; i < 16; i++) {
@@ -1221,7 +1233,11 @@ static uint32_t qry_calls, qry_sram_calls;
 // emulador. PEEK/WATCH continuam lendo o espelho vivo (in_do_frame gate).
 // Snapshot NAO filtra escrita-lixo (isso e' solda/ruido) -- elimina apenas
 // a incoerencia temporal.
-#define SNAP_MAX 1024
+// FF6 (115 achievements) consultou 944 bytes unicos = 92% de 1024 ->
+// dobrado p/ folga (+5KB de BSS). Acima do teto, bytes excedentes leem o
+// espelho vivo (sem atomicidade) silenciosamente -- vigiar "snapshot=" no
+// DBG em sets grandes.
+#define SNAP_MAX 2048
 static uint32_t snap_addr[SNAP_MAX];
 static uint8_t  snap_val[SNAP_MAX];
 static volatile uint16_t snap_count;
@@ -1904,11 +1920,59 @@ static void __not_in_flash_func(consume_cart_word)(uint32_t w) {
 // do caminho LoROM.
 static volatile uint32_t stat_hisram_commit;
 
+// Sonda da janela de expansao $6000-7FFF (INDEPENDENTE do mapa): escritas
+// validas (/WRAM=1, /WR=0) nessa janela que NAO viram commit -- e' onde
+// vivem SRAM de HiROM (ja tratada), registradores de DSP (DR/SR) e SRAMs
+// de boards especiais (caso SMK/1K1B: save nao aparece nem no /CART nem
+// aqui?). Contador + ring dos ultimos 8 addr=dado no DBG: no save do SMK,
+// se o contador pular e o ring mostrar offsets $6xxx-7xxx, achamos a
+// janela real e mapeamos com dado, nao palpite.
+// Split da janela (medido no SMK, 14/jul): o DSP-1 conversa em $6000/$6001
+// a ~2k escritas/s e AFOGA um ring unico. $6000-6FFF vira so contador
+// (DSP DR); $7000-7FFF ganha contador + ring proprios — nessa metade o
+// DSP nao escreve (SR e' so leitura), entao o ring fica MUDO ate um save
+// de SRAM aparecer (hipotese 1K1B: SRAM em $7000-77FF).
+// Split 2 (14/jul): o DSP DR observado usa SO $6000/$6001 — separa esses
+// dois enderecos do resto: qualquer escrita em $6002-6FFF (SRAM em bank
+// sobreposto ao DSP?) ganha ring proprio e aparece com addr=dado.
+static volatile uint32_t stat_exp_dsp;            // $6000/$6001 (DSP DR puro)
+static volatile uint32_t stat_exp_mid;            // $6002-6FFF (SRAM oculta?)
+static volatile uint32_t stat_exp_hi;             // $7000-7FFF (SRAM 1K1B?)
+// Rede final: offsets fora de TUDO -- $2200-3FFF e $4400-5FFF (acima dos
+// registradores B-bus/$21xx e CPU/$40xx-43xx, abaixo da expansao).
+// Escrita valida aqui = board decodificando SRAM em lugar exotico. Com
+// esta, TODO offset nao-WRAM < $8000 esta vigiado.
+static volatile uint32_t stat_exp_other;
+static volatile uint32_t exp_mid_ring[8], exp_hi_ring[8], exp_other_ring[8];
+static volatile uint8_t  exp_mid_idx, exp_hi_idx, exp_other_idx;
+
 static void __not_in_flash_func(consume_hisram_word)(uint32_t w) {
     if (!LOW_WRAM_N(w) || LOW_WR_N(w)) return;   // exige /WRAM=1 e /WR=0
-    if (!cart_info.is_hirom || cart_info.sram_size_bytes == 0) return;
+    {
+        uint32_t o16 = LOW_ADDR(w) & 0xFFFFu;
+        if (o16 == 0x6000u || o16 == 0x6001u) {
+            stat_exp_dsp++;
+        } else if (o16 >= 0x6002u && o16 < 0x7000u) {
+            stat_exp_mid++;
+            exp_mid_ring[exp_mid_idx++ & 7u] = w;
+        } else if (o16 >= 0x7000u && o16 < 0x8000u) {
+            stat_exp_hi++;
+            exp_hi_ring[exp_hi_idx++ & 7u] = w;
+        } else if ((o16 >= 0x2200u && o16 < 0x4000u) ||
+                   (o16 >= 0x4400u && o16 < 0x6000u)) {
+            stat_exp_other++;
+            exp_other_ring[exp_other_idx++ & 7u] = w;
+        }
+    }
+    if (!(cart_info.is_hirom || sram_exp_window) ||
+        cart_info.sram_size_bytes == 0) return;
     uint32_t off16 = LOW_ADDR(w) & 0xFFFFu;
     if (off16 < 0x6000u || off16 >= 0x8000u) return;   // fora da janela
+    // Board LoROM+DSP: $6000/$6001 sao o DR do DSP (banks baixos) -- nao
+    // mapear no espelho de SRAM (2 primeiros bytes ficam sem espelho;
+    // limitacao documentada, nenhum set conhecido le SRAM[0..1]).
+    if (sram_exp_window && !cart_info.is_hirom &&
+        (off16 == 0x6000u || off16 == 0x6001u)) return;
     uint32_t sram_off = off16 - 0x6000u;
     if (sram_off >= cart_info.sram_size_bytes || sram_off >= SRAM_MIRROR_SIZE)
         return;
@@ -2147,9 +2211,48 @@ static void debug_dump(void) {
         }
         printf("\n");
     }
-    printf("[dbg] hisram: dma=%lu rd=%lu words=%lu commits=%lu (so HiROM)\n",
+    printf("[dbg] hisram: dma=%lu rd=%lu words=%lu commits=%lu (HiROM/expSRAM) "
+           "| DSP($6000/01): %lu | $6002-6FFF: %lu | $7000-7FFF: %lu\n",
            (unsigned long)stream_wr_pos(&s_hisram), (unsigned long)s_hisram.rd,
-           (unsigned long)s_hisram.words, (unsigned long)stat_hisram_commit);
+           (unsigned long)s_hisram.words, (unsigned long)stat_hisram_commit,
+           (unsigned long)stat_exp_dsp, (unsigned long)stat_exp_mid,
+           (unsigned long)stat_exp_hi);
+    if (stat_exp_mid) {
+        printf("[dbg] janela $6002-6FFF (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = exp_mid_ring[(exp_mid_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    if (stat_exp_hi) {
+        printf("[dbg] janela $7xxx (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = exp_hi_ring[(exp_hi_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    printf("[dbg] fora-de-tudo ($2200-3FFF/$4400-5FFF): %lu\n",
+           (unsigned long)stat_exp_other);
+    if (stat_exp_other) {
+        printf("[dbg] fora-de-tudo (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = exp_other_ring[(exp_other_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    // Bytes de trofeu do SMK (code notes 0x207F0-0x207FF): dump fixo do
+    // espelho -- se um save reescrever o bloco, eles aparecem aqui e devem
+    // bater com o esperado (ex.: Mushroom 50cc Gold = bit2 em 0x207F2).
+    printf("[dbg] sram 207F0-207FF:");
+    for (uint32_t i = 0x7F0; i <= 0x7FF; i++)
+        printf(" %02X", sram_mirror[i]);
+    printf("\n");
     printf("[dbg] bport: dma=%lu rd=%lu words=%lu commits=%lu\n",
            (unsigned long)stream_wr_pos(&s_bport), (unsigned long)s_bport.rd,
            (unsigned long)s_bport.words, (unsigned long)stat_bport_commit);
