@@ -141,6 +141,10 @@
 #define LOW_RD_N(w)      (((w) >> 29) & 0x1u)
 #define LOW_REFRESH_N(w) (((w) >> 30) & 0x1u)
 #define LOW_PAWR_N(w)    (((w) >> 31) & 0x1u)
+// SNIFF: o A22 (slot 47) foi re-soldado no GP29 (o tap de /RD nunca foi
+// ligado). Ele resolve o mirror da WRAM: /WRAM & A22=1 => acesso direto
+// $7E/$7F (o A16 escolhe a metade); A22=0 => mirror => sempre $7E baixo.
+#define LOW_A22(w)       (((w) >> 29) & 0x1u)
 
 // PIO1 word (gpio_base=16, in_base=16, bit = GPIO-16):
 #define HI_A16(w)        (((w) >>  0) & 0x1u)
@@ -319,6 +323,10 @@ static void reset_bus_gpios(void) {
         gpio_set_dir(i, GPIO_IN);
         gpio_disable_pulls(i);
     }
+    // GP29 = A22 (re-soldado do slot 47). Pull-down para a auto-deteccao ler
+    // 0 quando o fio nao existe (=> FALLBACK), em vez de flutuar e mentir 1.
+    // Com o fio, o driver do console vence o pull (~50uA) com folga.
+    gpio_pull_down(SNES_RD_N);
 }
 
 /**
@@ -1201,6 +1209,38 @@ static uint32_t qry_sram_addr[QRY_SRAM_MAX];
 static uint8_t  qry_sram_n;
 static uint32_t qry_calls, qry_sram_calls;
 
+// --- Snapshot atomico dos enderecos de interesse (ideia do odelot) ----------
+//
+// O do_frame lia o espelho VIVO enquanto o core1 segue escrevendo: as N
+// condicoes de um achievement eram avaliadas sobre instantes ligeiramente
+// diferentes (tearing) -- conjuncoes multi-endereco (ex.: Peppy Special:
+// 0x1503 + 0x33A + 0xA05A no MESMO frame) podiam nunca fechar. Agora o
+// read_memory APRENDE quais bytes o set consulta (1o frame serve vivo e
+// registra) e, no inicio de CADA do_frame, snapshot_refresh() congela uma
+// copia deles -- a avaliacao inteira enxerga UM instante unico, como num
+// emulador. PEEK/WATCH continuam lendo o espelho vivo (in_do_frame gate).
+// Snapshot NAO filtra escrita-lixo (isso e' solda/ruido) -- elimina apenas
+// a incoerencia temporal.
+#define SNAP_MAX 1024
+static uint32_t snap_addr[SNAP_MAX];
+static uint8_t  snap_val[SNAP_MAX];
+static volatile uint16_t snap_count;
+static bool     in_do_frame;      // gate: snapshot so' vale p/ o rcheevos
+
+static inline uint8_t mirror_read_byte(uint32_t a) {
+    if (a < WRAM_MIRROR_SIZE) return wram_mirror[a];
+    if (a >= RCHEEVOS_SRAM_BASE && a < RCHEEVOS_SRAM_BASE + SRAM_MIRROR_SIZE)
+        return sram_mirror[a - RCHEEVOS_SRAM_BASE];
+    return 0;
+}
+
+/** Congela os bytes aprendidos (chamado imediatamente antes do do_frame). */
+static void snapshot_refresh(void) {
+    uint16_t n = snap_count;
+    for (uint16_t i = 0; i < n; i++)
+        snap_val[i] = mirror_read_byte(snap_addr[i]);
+}
+
 static uint32_t read_memory(uint32_t address, uint8_t *buffer,
                             uint32_t num_bytes, rc_client_t *client) {
     (void)client;
@@ -1216,13 +1256,23 @@ static uint32_t read_memory(uint32_t address, uint8_t *buffer,
     }
     for (uint32_t i = 0; i < num_bytes; i++) {
         uint32_t a = address + i;
-        if (a < WRAM_MIRROR_SIZE) {
-            buffer[i] = wram_mirror[a];
-        } else if (a >= RCHEEVOS_SRAM_BASE &&
-                   a < RCHEEVOS_SRAM_BASE + SRAM_MIRROR_SIZE) {
-            buffer[i] = sram_mirror[a - RCHEEVOS_SRAM_BASE];
+        if (in_do_frame) {
+            // Serve do snapshot congelado; miss = 1a consulta deste byte:
+            // serve vivo e registra p/ entrar no proximo refresh.
+            uint16_t k;
+            for (k = 0; k < snap_count; k++) {
+                if (snap_addr[k] == a) { buffer[i] = snap_val[k]; break; }
+            }
+            if (k == snap_count) {
+                buffer[i] = mirror_read_byte(a);
+                if (snap_count < SNAP_MAX) {
+                    snap_addr[snap_count] = a;
+                    snap_val[snap_count]  = buffer[i];
+                    snap_count++;
+                }
+            }
         } else {
-            buffer[i] = 0;
+            buffer[i] = mirror_read_byte(a);   // PEEK/WATCH: espelho vivo
         }
     }
     return num_bytes;
@@ -1587,6 +1637,18 @@ static bool     vsync_on = true;
 static uint32_t vsync_seen;
 static volatile uint32_t frames_vb, frames_timer;   // telemetria
 
+/**
+ * Avaliacao ATOMICA: congela o snapshot dos enderecos de interesse e roda o
+ * do_frame servindo leituras dele (gate in_do_frame) -- o rcheevos enxerga
+ * um instante unico do espelho, sem tearing do core1 escrevendo no meio.
+ */
+static void do_frame_atomic(void) {
+    snapshot_refresh();
+    in_do_frame = true;
+    rc_client_do_frame(g_client);
+    in_do_frame = false;
+}
+
 static void maybe_do_frame(void) {
     if (state != 8) return;
     uint64_t now = time_us_64();
@@ -1597,11 +1659,11 @@ static void maybe_do_frame(void) {
             vsync_seen = vc;
             last_frame_us = now;
             frames_vb++;
-            rc_client_do_frame(g_client);
+            do_frame_atomic();
         } else if (now - last_frame_us >= 25000) {
             last_frame_us = now;
             frames_timer++;
-            rc_client_do_frame(g_client);
+            do_frame_atomic();
         }
         return;
     }
@@ -1611,7 +1673,7 @@ static void maybe_do_frame(void) {
     if (now - last_frame_us >= frame_us) {
         last_frame_us = now;
         frames_timer++;
-        rc_client_do_frame(g_client);
+        do_frame_atomic();
     }
 }
 
@@ -1659,6 +1721,53 @@ static inline uint32_t __not_in_flash_func(addr_fix)(uint32_t a) {
 // Telemetria p/ DBG: escritas efetivamente aplicadas em cada espelho.
 static volatile uint32_t stat_wram_commit, stat_cart_commit, stat_bport_commit;
 
+// --- Resolucao de bank da WRAM via A22 (GP29) --------------------------------
+// A22 desfaz a ambiguidade mirror vs $7E/$7F direto (a colisao $7F:0000-1FFF
+// vs mirror de bank impar). Por PADRAO a resolucao e' SEMPRE exata: se o fio
+// do A22 estiver ruim, isso APARECE (missample>0 no DBG + captura errada nos
+// testes), em vez de ser silenciosamente mascarado.
+//
+// WRAM_BANK_FALLBACK (opt-in, default DESLIGADO): reativa o auto-detect do fio
+// com rede de double-write, para um chicote SEM o fio do A22. Fica off de
+// proposito -- uma rede silenciosa esconde uma solda ruim atras de "ta quase
+// funcionando", que e' PIOR do que falhar alto. So ligue se souber que aquele
+// hardware nao tem o A22 e voce aceita o veneno do double-write.
+// #define WRAM_BANK_FALLBACK
+typedef enum { BANKPAIR_EXACT = 0, BANKPAIR_PROBING, BANKPAIR_FALLBACK } bankpair_mode_t;
+#ifdef WRAM_BANK_FALLBACK
+// FORCADO em double-write: NUNCA le o GP29, NUNCA se auto-promove a EXACT.
+// (A 1a versao bootava em PROBING e, com o fio lendo 1 nos acessos diretos,
+// se promovia sozinha a EXACT em 64 escritas -- o "teste DW" de 15:21 rodou
+// EXACT sem querer e invalidou o experimento de isolamento. Licao: build de
+// isolamento nao pode ter caminho de promocao.)
+static volatile uint8_t  bankpair_mode = BANKPAIR_FALLBACK;
+static volatile uint32_t bankpair_confirms;   // morto (probe nunca roda)
+#define BANKPAIR_CONFIRM_TARGET 64u
+#else
+static volatile uint8_t  bankpair_mode = BANKPAIR_EXACT;    // confia no A22, falha alto
+#endif
+// Missample: mirror (A22=0) com offset >= 0x2000 e' impossivel -> A22 falhou
+// a amostra. SEMPRE contado -- e' o velocimetro da saude do fio no DBG
+// (>0 sustentado = reflow no GP29/slot 47). No modo exato tratamos como direto.
+static volatile uint32_t stat_a22_missample;
+
+// Censo de classes de escrita na WRAM (auditoria do mirror no DBG). Cada
+// jogo tem uma "assinatura" esperada:
+//   - mirror  > 0 SEMPRE (pagina-zero/pilha vivem nos 8KB baixos via mirror);
+//   - SMW: mirror dominante, dir7F ~0;
+//   - Star Fox: dir7F alto (scratch do SuperFX) e SEPARADO do mirror.
+// Absurdos denunciam bug/fio: mirror=0 e' impossivel; dir7F enorme no SMW
+// e' suspeito; missample>0 = fio do A22.
+//
+// dir7f_lo e' O DISCRIMINADOR da "mentira para cima" do A22 (ler 1 numa
+// escrita de mirror -- a direcao que o missample NAO enxerga): assinatura
+// (A22=1, A16=1, offset<0x2000) = escrita direta em $7F:0000-1FFF. No SMW
+// isso e' ~zero (ele nao usa $7F baixo); se aparecer aos MILHARES, sao
+// mirrors de bank impar sendo desviados => o fio NAO carrega o A22 real
+// (A17/A18/A19? solda no pino errado / ponte com vizinho no slot 47).
+static volatile uint32_t stat_wram_dir7e, stat_wram_dir7f_lo,
+                         stat_wram_dir7f_hi, stat_wram_mirror_w;
+
 // GREP=<addr>: conta capturas comitadas num endereco especifico, separadas
 // por origem (A-bus vs porta $2180). Distingue "o jogo nao escreve ai do
 // jeito que enxergamos" de "escreve mas o espelho/leitura erra".
@@ -1668,6 +1777,11 @@ static volatile uint32_t grep_hits_raw;    // match no addr ANTES da validacao
 static volatile uint32_t grep_hits_wram, grep_hits_bport;
 static volatile uint8_t  grep_last_wram, grep_last_bport;
 static volatile uint32_t grep_last_raw_word;   // palavra crua do ultimo match
+// Rastreador de COMMITS: ring das ultimas 8 palavras cruas que efetivamente
+// ESCREVERAM no endereco do GREP -- identifica o "vandalo" que pisoteia um
+// byte (endereco capturado + dado + a22 + a16 de cada escrita, no DBG).
+static volatile uint32_t grep_commit_ring[8];
+static volatile uint8_t  grep_commit_idx;
 
 // Log dos ultimos eventos da porta $2180-83 (diagnostico do ponteiro-sombra):
 //   set_log: escritas em $2181/82/83 -> (port<<25)|(data<<17)|ponteiro_apos
@@ -1683,38 +1797,93 @@ static void __not_in_flash_func(consume_wram_word)(uint32_t w) {
         grep_hits_raw++;                 // capturado, ainda sem validacao
         grep_last_raw_word = w;
     }
+    // /WR e /WRAM validados na propria palavra: descarta leitura de WRAM
+    // (/WR alto) e falsos gatilhos onde /WRAM ja subiu. So escrita passa.
     if (LOW_WRAM_N(w) || LOW_WR_N(w)) return;
     uint32_t a = addr_fix(LOW_ADDR(w));
     uint8_t  d = (uint8_t)LOW_DATA(w);
 
-    // MIRRORING de WRAM: banks 00-3F/80-BF espelham os primeiros 8KB em
-    // $0000-1FFF. Um write com DBR de bit0=1 (ex.: $01:0DC1) chega com
-    // A16=1 -> endereco cru 0x10DC1, mas o alvo real e' 0x00DC1. Com so
-    // A0-A16 nao da p/ distinguir esse caso de $7F:0000-1FFF legitimo
-    // (mesma assinatura), entao gravamos nos DOIS candidatos. Resolucao
-    // exata = 1 fio extra: A22 (slot 47 -> GP37/W24): /WRAM & A22=1 ->
-    // 7E/7F direto; A22=0 -> mirror. TODO fase 5b.
-    if (a >= 0x10000u && (a & 0xFFFFu) < 0x2000u) {
+#ifdef WRAM_BANK_FALLBACK
+    // Prova do fio A22 (escrita inequivocamente direta: offset >= 0x2000).
+    // So existe no modo com rede -- por padrao ja entramos direto em EXACT.
+    if (bankpair_mode == BANKPAIR_PROBING && (a & 0xFFFFu) >= 0x2000u) {
+        if (LOW_A22(w)) {
+            if (++bankpair_confirms >= BANKPAIR_CONFIRM_TARGET)
+                bankpair_mode = BANKPAIR_EXACT;
+        } else {
+            bankpair_mode = BANKPAIR_FALLBACK;   // pull-down leu 0: fio ausente
+        }
+    }
+#endif
+
+    if (bankpair_mode == BANKPAIR_EXACT) {
+        // Resolucao exata pelo A22 (caminho PADRAO).
+        uint32_t target;
+        if (LOW_A22(w)) {
+            target = a;                    // $7E/$7F direto (A16 e' o bit16)
+            if (a >= 0x10000u) {
+                if ((a & 0xFFFFu) < 0x2000u) stat_wram_dir7f_lo++;
+                else                         stat_wram_dir7f_hi++;
+            } else {
+                stat_wram_dir7e++;
+            }
+        } else if ((a & 0xFFFFu) < 0x2000u) {
+            target = a & 0x1FFFu;          // mirror -> sempre $7E baixo
+            stat_wram_mirror_w++;
+        } else {
+            stat_a22_missample++;          // mirror c/ off>=2000 e' impossivel:
+            target = a;                    // fio falhou -> trata direto e DENUNCIA
+        }
+        wram_mirror[target] = d;
+        if (target == grep_addr) {
+            grep_hits_wram++; grep_last_wram = d;
+            grep_commit_ring[grep_commit_idx++ & 7u] = w;
+        }
+    }
+#ifdef WRAM_BANK_FALLBACK
+    else if (a >= 0x10000u && (a & 0xFFFFu) < 0x2000u) {
+        // FALLBACK (fio ausente): double-write nos dois candidatos. O "lixo"
+        // do $7F fica em 0x1xxxx, so lido se um achievement ler $7F.
         uint32_t off = a & 0x1FFFu;
         wram_mirror[off]            = d;
         wram_mirror[0x10000u | off] = d;
         if (off == grep_addr || (0x10000u | off) == grep_addr) {
             grep_hits_wram++; grep_last_wram = d;
+            grep_commit_ring[grep_commit_idx++ & 7u] = w;
         }
-    } else {
+    }
+#endif
+    else {
+        // Escrita inequivoca (a<0x10000, ou offset>=0x2000 no modo com rede).
         wram_mirror[a] = d;
-        if (a == grep_addr) { grep_hits_wram++; grep_last_wram = d; }
+        if (a == grep_addr) {
+            grep_hits_wram++; grep_last_wram = d;
+            grep_commit_ring[grep_commit_idx++ & 7u] = w;
+        }
     }
     stat_wram_commit++;
     if (!flag_bus_written) flag_bus_written = true;
 }
+
+// Escritas de cart VALIDADAS (controles ok) que a janela de SRAM rejeitou:
+// separa "nenhuma escrita real chegou" de "chegou mas o filtro descartou"
+// (caso SMK/DSP boards: a SRAM pode viver numa janela fora do padrao LoROM).
+// O ring guarda as ultimas 8 palavras rejeitadas -- o DBG mostra ONDE o jogo
+// realmente escreve, e ai ajustamos a janela com dado, nao com palpite.
+static volatile uint32_t stat_cart_reject;
+static volatile uint32_t cart_reject_ring[8];
+static volatile uint8_t  cart_reject_idx;
 
 static void __not_in_flash_func(consume_cart_word)(uint32_t w) {
     if (LOW_CART_N(w) || LOW_WR_N(w)) return;
     uint32_t sram_off = bus_to_sram_offset(addr_fix(LOW_ADDR(w)),
                                            cart_info.is_hirom,
                                            cart_info.sram_size_bytes);
-    if (sram_off == BUS_NOT_SRAM || sram_off >= SRAM_MIRROR_SIZE) return;
+    if (sram_off == BUS_NOT_SRAM || sram_off >= SRAM_MIRROR_SIZE) {
+        stat_cart_reject++;
+        cart_reject_ring[cart_reject_idx++ & 7u] = w;
+        return;
+    }
     sram_mirror[sram_off] = (uint8_t)LOW_DATA(w);
     if ((RCHEEVOS_SRAM_BASE + sram_off) == grep_addr) {
         grep_hits_wram++;                 // origem A-bus (cart)
@@ -1963,9 +2132,21 @@ static void debug_dump(void) {
     printf("[dbg] wram : dma=%lu rd=%lu words=%lu commits=%lu\n",
            (unsigned long)stream_wr_pos(&s_wram), (unsigned long)s_wram.rd,
            (unsigned long)s_wram.words, (unsigned long)stat_wram_commit);
-    printf("[dbg] cart : dma=%lu rd=%lu words=%lu commits=%lu\n",
+    printf("[dbg] cart : dma=%lu rd=%lu words=%lu commits=%lu rejeitados=%lu\n",
            (unsigned long)stream_wr_pos(&s_cart), (unsigned long)s_cart.rd,
-           (unsigned long)s_cart.words, (unsigned long)stat_cart_commit);
+           (unsigned long)s_cart.words, (unsigned long)stat_cart_commit,
+           (unsigned long)stat_cart_reject);
+    if (stat_cart_reject) {
+        // Escritas de cart validas que a janela de SRAM descartou: mostra
+        // ONDE o jogo escreve de verdade (caso SMK: janela fora do padrao?)
+        printf("[dbg] cart rejeitados (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = cart_reject_ring[(cart_reject_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
     printf("[dbg] hisram: dma=%lu rd=%lu words=%lu commits=%lu (so HiROM)\n",
            (unsigned long)stream_wr_pos(&s_hisram), (unsigned long)s_hisram.rd,
            (unsigned long)s_hisram.words, (unsigned long)stat_hisram_commit);
@@ -2085,6 +2266,34 @@ static void debug_dump(void) {
                             PIO_SM0_PINCTRL_IN_BASE_BITS)
                            >> PIO_SM0_PINCTRL_IN_BASE_LSB));
 
+    // --- 11b. resolucao de bank via A22 (mirror vs $7E/$7F direto) ---
+    // ordem casa com o enum: EXACT=0, PROBING=1, FALLBACK=2
+    static const char *bp_names[] = { "EXACT", "PROBING", "FALLBACK" };
+    printf("[dbg] bankpair=%s missample=%lu A22(GP29)=%d | classes: "
+           "dir7E=%lu dir7F_lo=%lu dir7F_hi=%lu mirror=%lu\n",
+           bp_names[bankpair_mode],
+           (unsigned long)stat_a22_missample, gpio_get(SNES_RD_N),
+           (unsigned long)stat_wram_dir7e,
+           (unsigned long)stat_wram_dir7f_lo,
+           (unsigned long)stat_wram_dir7f_hi,
+           (unsigned long)stat_wram_mirror_w);
+    printf("[dbg]   (SMW ground truth: dir7F_lo~0. Aos milhares = fio do "
+           "A22 mentindo p/ cima -> mirrors de bank impar desviados)\n");
+
+    // --- 11c. rastreador de commits do GREP: quem escreveu no endereco ---
+    if (grep_addr != GREP_DISABLED) {
+        printf("[dbg] grep commits (addr=dado a22.a16, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = grep_commit_ring[(grep_commit_idx - k) & 7u];
+            printf(" %05lX=%02lX %lu.%lu",
+                   (unsigned long)LOW_ADDR(rw),
+                   (unsigned long)LOW_DATA(rw),
+                   (unsigned long)LOW_A22(rw),
+                   (unsigned long)((rw >> 16) & 1u));
+        }
+        printf("\n");
+    }
+
     // --- 12. espelho de SRAM: bytes != 0 (enderecos ja em espaco rcheevos) ---
     uint32_t snz = 0, sshown = 0;
     printf("[dbg] espelho SRAM != 0:");
@@ -2101,9 +2310,10 @@ static void debug_dump(void) {
     printf(" (total %lu bytes)\n", (unsigned long)snz);
 
     // --- 11. enderecos que o rcheevos consulta (rastreio passivo) ---
-    printf("[dbg] rc queries: total=%lu sram=%lu | sram unicos=%u:",
+    printf("[dbg] rc queries: total=%lu sram=%lu snapshot=%u bytes | "
+           "sram unicos=%u:",
            (unsigned long)qry_calls, (unsigned long)qry_sram_calls,
-           (unsigned)qry_sram_n);
+           (unsigned)snap_count, (unsigned)qry_sram_n);
     for (uint8_t k = 0; k < qry_sram_n; k++) {
         printf(" %05lX=%02X", (unsigned long)qry_sram_addr[k],
                sram_mirror[qry_sram_addr[k] - RCHEEVOS_SRAM_BASE]);
@@ -2222,10 +2432,17 @@ static void maybe_grep(void) {
     if (grep_addr == GREP_DISABLED) return;
     uint32_t hw = grep_hits_wram, hb = grep_hits_bport;
     if (hw != grep_seen_wram || hb != grep_seen_bport) {
-        printf("[grep] %05lX: wram hits=%lu last=%02X | bport hits=%lu last=%02X\n",
+        // raw = ultima palavra crua que casou o endereco (pre-validacao):
+        // a22/a16 dizem a CLASSE da escrita (direto $7E/$7F vs mirror).
+        uint32_t rw = grep_last_raw_word;
+        printf("[grep] %05lX: wram hits=%lu last=%02X | bport hits=%lu "
+               "last=%02X | raw=%08lX a22=%lu a16=%lu\n",
                (unsigned long)grep_addr,
                (unsigned long)hw, grep_last_wram,
-               (unsigned long)hb, grep_last_bport);
+               (unsigned long)hb, grep_last_bport,
+               (unsigned long)rw,
+               (unsigned long)LOW_A22(rw),
+               (unsigned long)((rw >> 16) & 1u));
         grep_seen_wram = hw; grep_seen_bport = hb;
         sleep_ms(50);   // limita a ~20 prints/s se o endereco for quente
     }
