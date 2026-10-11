@@ -62,8 +62,8 @@
  * remember: you need to deploy the lambda and inform its URL
  */
 
-#define ENABLE_SHRINK_LAMBDA 0 // 0 - disable / 1 - enable
-#define SHRINK_LAMBDA_URL "https://XXXXXXXX.execute-api.us-east-1.amazonaws.com/default/XXXXXXXX?"
+#define ENABLE_SHRINK_LAMBDA 1 // 0 - disable / 1 - enable
+#define SHRINK_LAMBDA_URL "https://xxxxxxxxx.execute-api.us-east-1.amazonaws.com/default/NES_RA_ADAPTER?"
 
 /**
  enable internal web app (comment to disable)
@@ -137,7 +137,7 @@
 #define SERIAL_COMM_CHUNK_SIZE 64
 #define SERIAL_COMM_TX_DELAY_MS 2
 
-#define SERIAL_MAX_PICO_BUFFER 61440 // Pico 2 (RP2350) tem buffer de 64KB; margem p/ prefixo RESP=
+#define SERIAL_MAX_PICO_BUFFER 92160 // Fase A: Pico 2 com buffer de 96KB; margem p/ prefixo RESP=
 /**
  * defines for the fifo used to store achievements to be showed on screen
  */
@@ -305,6 +305,10 @@ bool fifo_is_full(achievements_FIFO_t *fifo);
 bool fifo_enqueue(achievements_FIFO_t *fifo, achievements_t value);
 bool fifo_dequeue(achievements_FIFO_t *fifo, achievements_t *value);
 void show_achievement(achievements_t achievement);
+#ifdef ENABLE_LCD
+struct LcdTheme;
+const LcdTheme& activeTheme();
+#endif
 
 
 // global variables for LED control
@@ -321,6 +325,94 @@ File png_file;
 
 // global variables for the TFT screen
 TFT_eSPI tft = TFT_eSPI();
+
+// ----------------------------------------------------------------------------
+// LCD color theme
+// ----------------------------------------------------------------------------
+// Groups every color used to draw the title/achievement screens so the whole
+// look & feel can be swapped by selecting a different LcdTheme.
+struct LcdTheme {
+  const char* name;
+  uint16_t background;   // outer screen background (behind header/footer text)
+  uint16_t headerText;    // title/header text color, drawn over `background`
+  uint16_t footerText;    // footer text color, drawn over `background`
+  uint16_t boxBorder;     // border of the rounded content box
+  uint16_t boxFill;       // fill of the rounded content box (title/achievement area)
+  uint16_t contentText;   // text color drawn inside the content box
+  uint16_t statusOk;      // status dot / wifi bars - ok
+  uint16_t statusWarn;    // status dot - warning
+  uint16_t statusError;   // status dot / wifi - error
+};
+
+// Theme 0 - Classic: the original look (yellow background, blue border, black box, white text)
+const LcdTheme THEME_CLASSIC = {
+  "Classic",
+  TFT_YELLOW, // background
+  TFT_BLACK,  // headerText
+  TFT_BLACK,  // footerText
+  TFT_BLUE,   // boxBorder
+  TFT_BLACK,  // boxFill
+  TFT_WHITE,  // contentText
+  TFT_GREEN,  // statusOk
+  TFT_YELLOW, // statusWarn
+  TFT_RED     // statusError
+};
+
+const LcdTheme THEME_RETRO = {
+  "Retro",
+  0x1904,   // background
+  0xef3c,  // headerText
+  0x9d14,  // footerText
+  0x05f7,   // boxBorder
+  0x10a3,  // boxFill
+  0xef3c,  // contentText
+  TFT_GREEN,  // statusOk
+  TFT_YELLOW, // statusWarn
+  TFT_RED     // statusError
+};
+
+const LcdTheme THEME_TECH = {
+  "Tech",
+  0x00c7,   // background
+  0xf7de,  // headerText
+  0x9d14,  // footerText
+  0x35dd,   // boxBorder
+  0x0085,  // boxFill
+  0xce7a,  // contentText
+  TFT_GREEN,  // statusOk
+  TFT_YELLOW, // statusWarn
+  TFT_RED     // statusError
+};
+
+const LcdTheme THEME_TERMINAL = {
+  "Terminal",
+  0x0041,   // background
+  0x37a4,  // headerText
+  0x2cc4,  // footerText
+  0x2e85,   // boxBorder
+  0x0841,  // boxFill
+  0x5647,  // contentText
+  TFT_GREEN,  // statusOk
+  TFT_YELLOW, // statusWarn
+  TFT_RED     // statusError
+};
+
+
+
+// Templates for the next 5 themes - start as a copy of Classic; replace the
+// name and color values once the reference images are available.
+const LcdTheme THEME_2 = THEME_RETRO;
+const LcdTheme THEME_3 = THEME_TECH;
+const LcdTheme THEME_4 = THEME_TERMINAL;
+
+
+const LcdTheme* const LCD_THEMES[] = { &THEME_CLASSIC, &THEME_2, &THEME_3, &THEME_4};
+const uint8_t LCD_THEME_COUNT = sizeof(LCD_THEMES) / sizeof(LCD_THEMES[0]);
+uint8_t currentThemeIndex = 3; // index into LCD_THEMES of the active theme
+
+inline const LcdTheme& activeTheme() {
+  return *LCD_THEMES[currentThemeIndex];
+}
 #endif
 
 // global variables for the achievements fifo
@@ -342,6 +434,77 @@ AsyncWebSocketClient *ws_client = NULL;
 bool websocket_initialized = false;
 #endif
 
+// -----------------------------------------------------------------------------
+// Seletor de jogo do modo sniff do Pico (pagina /game, para trocar do celular)
+// -----------------------------------------------------------------------------
+// Independente do webapp experimental: com ENABLE_INTERNAL_WEB_APP_SUPPORT a
+// rota entra no server principal (em init_websocket); sem ele, sobe um
+// AsyncWebServer minimo so com /game assim que o WiFi conectar.
+// Lista de jogos DUPLICADA da tabela sniff_games[] do
+// snes-pico-firmware/src/main.c -- manter as duas em sincronia.
+
+static uint32_t game_switch_restart_at = 0;  // 0 = nada pendente
+static bool game_selector_started = false;
+
+static const char GAME_MENU_HTML[] PROGMEM =
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>body{font-family:sans-serif;background:#222;color:#eee;text-align:center}"
+    "a{display:block;margin:12px auto;padding:16px;max-width:320px;background:#444;"
+    "color:#fff;text-decoration:none;border-radius:8px;font-size:1.2em}</style>"
+    "<h2>SNES RA &mdash; trocar jogo</h2>"
+    "<a href='/game?n=0'>Super Mario World</a>"
+    "<a href='/game?n=1'>Street Fighter II</a>"
+    "<a href='/game?n=2'>Final Fantasy III (J)</a>"
+    "<a href='/game?n=3'>Yoshi's Island</a>"
+    "<a href='/game?n=4'>Star Fox</a>"
+    "<a href='/game?n=5'>Mega Man X</a>"
+    "<a href='/game?n=6'>Super Castlevania IV</a>"
+    "<a href='/game?n=7'>EarthBound</a>"
+    "<a href='/game?n=8'>Zelda: A Link to the Past</a>"
+    "<a href='/game?n=9'>Super Punch-Out!!</a>"
+    "<a href='/game?n=10'>Super Mario Kart</a>";
+
+static void game_selector_route(AsyncWebServer *srv)
+{
+  srv->on("/game", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("n")) {
+      String n = request->getParam("n")->value();
+      Serial.print(F("GAME SWITCH -> "));
+      Serial.println(n);
+      Serial0.print(F("GAME="));
+      Serial0.print(n);
+      Serial0.print(F("\r\n"));
+      Serial0.flush();
+      request->send(200, "text/html",
+        F("<meta name='viewport' content='width=device-width'>"
+          "<h2>Trocando de jogo...</h2>"
+          "<p>O adaptador vai reiniciar. Recarregue em ~20s.</p>"));
+      game_switch_restart_at = millis() + 500;  // restart no loop(), pos-flush
+    } else {
+      request->send_P(200, "text/html", GAME_MENU_HTML);
+    }
+  });
+}
+
+// Chamado do loop(): no build sem webapp, cria o server minimo quando o WiFi
+// estiver de pe. No build com webapp e' no-op (rota ja vai no server principal).
+static void maybe_start_game_selector()
+{
+#ifndef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  if (game_selector_started || WiFi.status() != WL_CONNECTED)
+    return;
+  AsyncWebServer *srv = new (std::nothrow) AsyncWebServer(80);
+  if (srv == nullptr)
+    return;                     // sem memoria: tenta de novo no proximo loop
+  game_selector_route(srv);
+  srv->begin();
+  game_selector_started = true; // nunca destruimos: vive ate o proximo reboot
+  Serial.print(F("seletor de jogos: http://"));
+  Serial.print(WiFi.localIP());
+  Serial.println(F("/game"));
+#endif
+}
+
 // global variables for the state machine
 DeviceState state = STATE_UNINITIALIZED;
 
@@ -362,7 +525,7 @@ char serial_buffer[SERIAL_BUFFER_SIZE];
 size_t serial_buffer_len = 0;
 
 // Flexible buffer for large HTTP responses 
-#define LARGE_BUFFER_SIZE 102400 // 100 KB 
+#define LARGE_BUFFER_SIZE 64000 // 64 KB 
 #define SMALL_BUFFER_SIZE 10240 // 10 KB
 CharBufferStream response;
 // HTTP client global to reuse SSL buffers (avoids fragmentation)
@@ -886,8 +1049,9 @@ void initLCD () {
   #endif
 
   //  draw the title screen
-  tft.fillScreen(TFT_YELLOW);
-  tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+  const LcdTheme& theme = activeTheme();
+  tft.fillScreen(theme.background);
+  tft.setTextColor(theme.headerText, theme.background, true);
 
   tft.setCursor(10, 10, 4);
   tft.setTextSize(1);
@@ -895,11 +1059,12 @@ void initLCD () {
   tft.setCursor(140, 40, 4);
   tft.println("Adapter");
 
-  tft.fillRoundRect(16, 76, 208, 128, 15, TFT_BLUE);
-  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
+  tft.fillRoundRect(16, 76, 208, 128, 15, theme.boxBorder);
+  tft.fillRoundRect(20, 80, 200, 120, 12, theme.boxFill);
 
-  tft.setCursor(75, 220, 2);
-  tft.println("by Odelot & GH");
+  tft.setTextColor(theme.footerText, theme.background, true);
+  tft.setCursor(60, 220, 2);
+  tft.println("by Odelot & mi213");
 }
 #endif
 
@@ -1111,7 +1276,7 @@ void play_sound_achievement_unlocked()
 // print a line of text in the TFT screen
 void print_line(const char* text, int line, int line_status)
 {
-  print_line(text, line, line_status, 0, TFT_BLACK);
+  print_line(text, line, line_status, 0, activeTheme().boxFill);
 }
 
 // print a line of text in the TFT screen
@@ -1121,15 +1286,16 @@ void print_line_bgcolor(const char* text, int line, int line_status, int color)
 }
 
 void print_line(const char* text, int line, int line_status, int delta) {
-  print_line(text, line, line_status, delta, TFT_BLACK);
+  print_line(text, line, line_status, delta, activeTheme().boxFill);
 }
 
 // print a line of text in the TFT screen with a delta (left to right)
 void print_line(const char* text, int line, int line_status, int delta, int color)
 {
   #ifdef ENABLE_LCD
+  const LcdTheme& theme = activeTheme();
   tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, color, true);
+  tft.setTextColor(theme.contentText, color, true);
   tft.setCursor(20, 90 + line * 22, 2);
   tft.println("                                 ");
   tft.setCursor(46 + delta, 90 + line * 22, 2);
@@ -1140,15 +1306,15 @@ void print_line(const char* text, int line, int line_status, int delta, int colo
   tft.println(text);
   if (line_status == 2)
   {
-    tft.fillCircle(32, 98 + line * 22, 7, TFT_RED);
+    tft.fillCircle(32, 98 + line * 22, 7, theme.statusError);
   }
   else if (line_status == 1)
   {
-    tft.fillCircle(32, 98 + line * 22, 7, TFT_YELLOW);
+    tft.fillCircle(32, 98 + line * 22, 7, theme.statusWarn);
   }
   else if (line_status == 0)
   {
-    tft.fillCircle(32, 98 + line * 22, 7, TFT_GREEN);
+    tft.fillCircle(32, 98 + line * 22, 7, theme.statusOk);
   }
   #endif
 }
@@ -1167,24 +1333,25 @@ void clean_screen_text()
 void showWifiStatus()
 {
 #ifdef ENABLE_LCD
+  const LcdTheme& theme = activeTheme();
   if (WiFi.status() != WL_CONNECTED) {
     // Draw X for no connection
-    tft.drawLine(215, 5, 235, 20, TFT_RED);
-    tft.drawLine(235, 5, 215, 20, TFT_RED);
+    tft.drawLine(215, 5, 235, 20, theme.statusError);
+    tft.drawLine(235, 5, 215, 20, theme.statusError);
     return;
   }
-  
+
   int rssi = WiFi.RSSI();
   int bars = 0;
   if (rssi > -50) bars = 4;
   else if (rssi > -60) bars = 3;
   else if (rssi > -70) bars = 2;
   else if (rssi > -80) bars = 1;
-  
+
   // Clear area and draw WiFi bars
-  tft.fillRect(215, 5, 22, 18, TFT_YELLOW);
+  tft.fillRect(215, 5, 22, 18, theme.background);
   for (int i = 0; i < 4; i++) {
-    uint16_t color = (i < bars) ? TFT_GREEN : TFT_DARKGREY;
+    uint16_t color = (i < bars) ? theme.statusOk : TFT_DARKGREY;
     int barHeight = 4 + i * 4;
     tft.fillRect(217 + i * 5, 22 - barHeight, 3, barHeight, color);
   }
@@ -1196,13 +1363,14 @@ void showAchievementCounter()
 {
 #ifdef ENABLE_LCD
   if (total_achievements > 0) {
+    const LcdTheme& theme = activeTheme();
     char counter[16];
     sprintf(counter, "%d/%d", unlocked_achievements, total_achievements);
-    tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+    tft.setTextColor(theme.headerText, theme.background, true);
     tft.setTextDatum(TL_DATUM);
     tft.setTextSize(1);
     // Clear area first
-    tft.fillRect(5, 5, 60, 18, TFT_YELLOW);
+    tft.fillRect(5, 5, 60, 18, theme.background);
     tft.drawString(counter, 8, 8, 2);
   }
 #endif
@@ -1215,7 +1383,8 @@ void show_title_screen()
 #ifdef ENABLE_LCD  
   analogWrite(LCD_BRIGHTNESS_PIN, 150); // set the brightness of the TFT screen
   setCpuFrequencyMhz(160);
-  tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+  const LcdTheme& theme = activeTheme();
+  tft.setTextColor(theme.headerText, theme.background, true);
 
   tft.setTextSize(1);
   tft.setTextPadding(240);
@@ -1233,7 +1402,7 @@ void show_title_screen()
   tft.drawString(esp_game_name, 120, 40, 4);
   tft.setTextPadding(0);
 
-  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
+  tft.fillRoundRect(20, 80, 200, 120, 12, theme.boxFill);
   x_pos = 72;
   y_pos = 92;
   String file_name = "/title_" + game_id + ".png";
@@ -1277,12 +1446,13 @@ void show_achievement(achievements_t achievement)
   }
 
   setCpuFrequencyMhz(160);
-  
+  const LcdTheme& theme = activeTheme();
+
   // Download achievement image first
   char file_name[64];
   sprintf(file_name, "/achievement_%d.png", achievement.id);
   try_download_file(achievement.url, file_name);
-  
+
   // Helper lambda to redraw the achievement screen with a specific background color
   auto redrawAchievementScreen = [&](uint16_t bgColor) {
     tft.fillRoundRect(20, 80, 200, 120, 12, bgColor);
@@ -1306,29 +1476,28 @@ void show_achievement(achievements_t achievement)
     }
   };
   
-  // Initial draw with black background
-  redrawAchievementScreen(TFT_BLACK);
+  // Initial draw with the theme's box fill as background
+  redrawAchievementScreen(theme.boxFill);
   Serial.println(achievement.title);
-  
+
   // Check if game was mastered (all achievements unlocked)
   //if (unlocked_achievements == 1) //test
   if (unlocked_achievements > 0 && unlocked_achievements == total_achievements)
   {
     // MASTERED! Celebration mode
     Serial.println(F("GAME MASTERED! Playing victory fanfare"));
-    
+
     // Show MASTERED text in larger font over the footer area
-    tft.setTextColor(TFT_BLACK, TFT_YELLOW);
+    tft.setTextColor(theme.footerText, theme.background);
     tft.setTextDatum(MC_DATUM);
     tft.drawString("** MASTERED! **", 120, 225, 4);  // Larger font (4), above footer
     tft.setTextDatum(TL_DATUM);  // Reset datum
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            
-    uint16_t colorBlack = TFT_BLACK;
-    uint16_t colorGreen = tft.color565(0, 100, 0);  
-    uint16_t colors[] = { colorGreen, colorBlack };
+    tft.setTextColor(theme.contentText, theme.boxFill);
+
+    uint16_t colorGreen = tft.color565(0, 100, 0);
+    uint16_t colors[] = { colorGreen, theme.boxFill };
     int colorIndex = 0;
-    
+
     // Flash background a few times before music
     for (int i = 0; i < 6; i++)
     {
@@ -1336,10 +1505,10 @@ void show_achievement(achievements_t achievement)
       colorIndex = (colorIndex + 1) % 2;
       delay(150);
     }
-    
+
     // Play victory fanfare
     play_victory_sound();
-    
+
     // Flash more after music
     for (int i = 0; i < 6; i++)
     {
@@ -1347,10 +1516,10 @@ void show_achievement(achievements_t achievement)
       colorIndex = (colorIndex + 1) % 2;
       delay(150);
     }
-    
-    // Restore black background
-    redrawAchievementScreen(TFT_BLACK);
-    
+
+    // Restore box fill background
+    redrawAchievementScreen(theme.boxFill);
+
   }
   else
   {
@@ -1879,6 +2048,9 @@ void init_websocket()
   server->serveStatic("/snd.mp3", LittleFS, "/snd.mp3")
       .setCacheControl("max-age=86400");
 
+  // Seletor de jogo (modo sniff): rota /game no server principal
+  game_selector_route(server);
+
   server->addHandler(ws);
   server->begin();
   
@@ -2318,10 +2490,11 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
   if (is_patch_request) {
     // print_memory_stats("BEFORE PATCH REQUEST");
     
-    // Trim trailing spaces and add &f=3
+    // Trim trailing spaces; add &f=3 + orcamento p/ o lambda (Fase A:
+    // o Pico 2 aceita 90KB; NES antigos nao mandam &max e ficam nos 32KB)
     while (data_len > 0 && data[data_len - 1] == ' ') data_len--;
-    strcpy(data + data_len, "&f=3");
-    data_len += 4;
+    strcpy(data + data_len, "&f=3&max=90000");
+    data_len += 14;
     
     
   }
@@ -2834,10 +3007,25 @@ void setup()
   }
 
   delay(1000);
-  
+
+#ifdef ENABLE_LCD
+  // Aloca o decodificador PNG (~48KB contiguos do PNGdec) AGORA, com a
+  // heap fresca de boot -- antes do buffer grande de resposta. Alocar
+  // tarde (em init_websocket, pos-patch) falhava por fragmentacao: o
+  // new(nothrow) retornava nullptr e as imagens sumiam em silencio
+  // (era tambem a causa do abort/reboot antes do nothrow).
+  if (png == nullptr) {
+    png = new (std::nothrow) PNG();
+    if (png == nullptr) {
+      Serial.println(F("PNG decoder alloc FAILED at boot!"));
+    } else {
+      Serial.println(F("PNG decoder allocated at boot"));
+    }
+  }
+#endif
 
   // print_memory_stats("BEFORE LARGE BUFFER ALLOCATION");
-  
+
   if (response.reserve(LARGE_BUFFER_SIZE)) {
     Serial.print(F("Large response buffer allocated: ")); 
     Serial.print(LARGE_BUFFER_SIZE); 
@@ -3092,6 +3280,14 @@ void setup()
 // arduino-esp32 main loop
 void loop()
 {
+  maybe_start_game_selector();
+
+  // Troca de jogo via /game: o Pico ja recebeu GAME=<n> e esta rebootando
+  // com o indice novo; reinicia o ESP32 tambem para ressincronizar do zero.
+  if (game_switch_restart_at != 0 && millis() > game_switch_restart_at)
+  {
+    ESP.restart();
+  }
 
 #ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
   if (websocket_initialized && ws != nullptr) {

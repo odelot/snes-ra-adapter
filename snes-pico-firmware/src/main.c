@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <malloc.h>
 
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
@@ -39,6 +40,8 @@
 #include "hardware/gpio.h"
 #include "hardware/vreg.h"
 #include "hardware/watchdog.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 
 #include "snes-bus.pio.h"
 
@@ -138,6 +141,10 @@
 #define LOW_RD_N(w)      (((w) >> 29) & 0x1u)
 #define LOW_REFRESH_N(w) (((w) >> 30) & 0x1u)
 #define LOW_PAWR_N(w)    (((w) >> 31) & 0x1u)
+// SNIFF: o A22 (slot 47) foi re-soldado no GP29 (o tap de /RD nunca foi
+// ligado). Ele resolve o mirror da WRAM: /WRAM & A22=1 => acesso direto
+// $7E/$7F (o A16 escolhe a metade); A22=0 => mirror => sempre $7E baixo.
+#define LOW_A22(w)       (((w) >> 29) & 0x1u)
 
 // PIO1 word (gpio_base=16, in_base=16, bit = GPIO-16):
 #define HI_A16(w)        (((w) >>  0) & 0x1u)
@@ -316,6 +323,10 @@ static void reset_bus_gpios(void) {
         gpio_set_dir(i, GPIO_IN);
         gpio_disable_pulls(i);
     }
+    // GP29 = A22 (re-soldado do slot 47). Pull-down para a auto-deteccao ler
+    // 0 quando o fio nao existe (=> FALLBACK), em vez de flutuar e mentir 1.
+    // Com o fio, o driver do console vence o pull (~50uA) com folga.
+    gpio_pull_down(SNES_RD_N);
 }
 
 /**
@@ -624,6 +635,12 @@ typedef struct {
 
 static snes_cart_info_t cart_info;
 
+// SRAM na janela de expansao $6000-7FFF SEM /ROMSEL em cart LoROM (boards
+// DSP tipo SHVC-1K1B; descoberto no SMK 14/jul: save do TT em $66EC-$66FC).
+// Setado pela tabela do modo sniff; abre o gate do consume_hisram_word
+// tambem para LoROM. No cart-ID real (fase 5) vira heuristica de board.
+static bool sram_exp_window = false;
+
 /**
  * Sequentially read N bytes from a contiguous bus address range into dst.
  * Used for header reads only -- the streaming MD5 loop uses cart_read_byte
@@ -766,42 +783,99 @@ static void cart_compute_md5(bool is_hirom, uint32_t rom_size_bytes,
 // nos pontos do slot embaixo do console, Pico alimentado pelo USB, GND comum.
 // Neste modo o firmware NUNCA dirige nenhum pino do barramento (nao ha
 // switches para isolar e o console esta vivo!): o cart-ID vira um stub que
-// preenche cart_info com os valores chumbados abaixo, e a captura ja arma
-// no boot. Descomente e preencha com o MD5 (hash RA) do jogo plugado:
+// preenche cart_info a partir da TABELA de jogos abaixo. O jogo ativo e'
+// trocado SEM reflash: comando GAME=<n> (USB serial ou pagina /game do
+// ESP32) grava o indice e reinicia. Persistencia no ultimo setor da flash.
+// Comente SNIFF_ONLY_MODE para voltar ao cart-ID real (fase 5).
 //
-#define SNIFF_ONLY_MD5     "544311e104805e926083acf29ec664da"  // Final Fantasy III (J)
-#define SNIFF_ONLY_HIROM   1    // FF3/FF6j = HiROM (estreia do branch HiROM!)
-#define SNIFF_ONLY_SRAM_KB 8    // 8 KB de SRAM (saves) -- set USA 0x02xxxx
-#define SNIFF_ONLY_NTSC    1    // Japao = NTSC
+#define SNIFF_ONLY_MODE 1
 
-#ifdef SNIFF_ONLY_MD5
-#ifndef SNIFF_ONLY_HIROM
-#define SNIFF_ONLY_HIROM 0
-#endif
-#ifndef SNIFF_ONLY_SRAM_KB
-#define SNIFF_ONLY_SRAM_KB 0
-#endif
-#ifndef SNIFF_ONLY_NTSC
-#define SNIFF_ONLY_NTSC 1
-#endif
+#ifdef SNIFF_ONLY_MODE
+
+typedef struct {
+    const char *name;      // vai no cart_info.title (max 21 chars, sem ';')
+    const char *md5;       // hash RA da ROM, 32 hex
+    uint8_t     is_hirom;
+    uint16_t    sram_kb;   // janela de SRAM espelhada (LoROM $70 / HiROM $3x:6-7FFF)
+    uint8_t     is_ntsc;
+    // Boards LoROM+DSP (SHVC-1K1B, ex. SMK): a SRAM vive na janela de
+    // expansao $6000-7FFF SEM /ROMSEL (igual HiROM), com o DSP nos banks
+    // baixos da MESMA janela. DESCOBERTO no SMK em 14/jul: save do Time
+    // Trial capturado em $66EC-$66FC (sram_off = offset - $6000).
+    uint8_t     exp_sram;
+} sniff_game_t;
+
+// ATENCAO: a pagina /game do snes-esp-firmware.ino duplica esta lista
+// (nomes+indices) -- mantenha as duas em sincronia ao editar.
+static const sniff_game_t sniff_games[] = {
+    { "Super Mario World",     "cdd3c8c37322978ca8669b34bc89c804", 0,  2, 1, 0 },
+    { "Street Fighter II",     "be7fc84ac1151b99ad48329327e2aaa7", 0,  0, 1, 0 },
+    { "Final Fantasy III (J)", "544311e104805e926083acf29ec664da", 1,  8, 1, 0 },
+    { "Yoshi's Island",        "cb472164c5a71ccd3739963390ec6a50", 0, 32, 1, 0 },
+    { "Star Fox",              "9dce6a9dcbe4e304d67b9e8fd8999e7e", 0, 32, 1, 0 },
+    { "Mega Man X",            "df1cc0c8c8c4b61e3b834cc03366611c", 0,  0, 1, 0 },
+    { "Super Castlevania IV",  "094f035993e9724647b61ddcba1e9a7a", 0,  0, 1, 0 },
+    { "EarthBound",            "a864b2e5c141d2dec1c4cbed75a42a85", 1,  8, 1, 0 },
+    { "Zelda: Link to Past",   "608c22b8ff930c62dc2de54bcd6eba72", 0,  8, 1, 0 },
+    { "Super Punch-Out!!",     "97fe7d7d2a1017f8480e60a365a373f0", 0,  8, 1, 0 },
+    { "Super Mario Kart",      "7f25ce5a283d902694c52fb1152fa61a", 0,  2, 1, 1 },
+};
+#define SNIFF_GAME_COUNT   (sizeof(sniff_games) / sizeof(sniff_games[0]))
+#define SNIFF_GAME_DEFAULT 4u   // usado so' quando a flash ainda esta virgem
+
+static uint8_t sniff_active_game = SNIFF_GAME_DEFAULT;
+
+// Persistencia do indice: ultimo setor da flash (o RP2350 nao tem EEPROM).
+// Escrever flash com o core1 capturando (codigo XIP) = hardfault; por isso
+// GAME=<n> apenas deixa o pedido no scratch do watchdog (sobrevive ao reboot,
+// nao a power-off) e reinicia -- game_slot_boot_init() persiste na flash no
+// comeco do boot, quando so o core0 existe. scratch[4..7] sao do bootrom/
+// watchdog_reboot; usamos [0]/[1].
+#define GAME_SLOT_MAGIC     0x534E4946u   // "SNIF"
+#define GAME_SLOT_FLASH_OFF (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+
+static void game_slot_boot_init(void) {
+    if (watchdog_hw->scratch[0] == GAME_SLOT_MAGIC &&
+        watchdog_hw->scratch[1] < SNIFF_GAME_COUNT) {
+        uint8_t idx = (uint8_t)watchdog_hw->scratch[1];
+        watchdog_hw->scratch[0] = 0;
+        uint8_t page[FLASH_PAGE_SIZE];
+        memset(page, 0xFF, sizeof(page));
+        page[0] = 'S'; page[1] = 'N'; page[2] = 'I'; page[3] = 'F';
+        page[4] = idx;
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(GAME_SLOT_FLASH_OFF, FLASH_SECTOR_SIZE);
+        flash_range_program(GAME_SLOT_FLASH_OFF, page, FLASH_PAGE_SIZE);
+        restore_interrupts(ints);
+    }
+    const uint8_t *p = (const uint8_t *)(XIP_BASE + GAME_SLOT_FLASH_OFF);
+    if (p[0] == 'S' && p[1] == 'N' && p[2] == 'I' && p[3] == 'F' &&
+        p[4] < SNIFF_GAME_COUNT) {
+        sniff_active_game = p[4];
+    }
+}
 
 static void sniff_fill_cart_info(void) {
-    memset(&cart_info, 0, sizeof(cart_info));
-    strcpy(cart_info.title, "SNIFF-ONLY");
-    cart_info.header_valid    = true;
-    cart_info.is_hirom        = (SNIFF_ONLY_HIROM) != 0;
-    cart_info.is_ntsc         = (SNIFF_ONLY_NTSC) != 0;
-    cart_info.sram_size_bytes = (uint32_t)(SNIFF_ONLY_SRAM_KB) * 1024u;
+    const sniff_game_t *g = &sniff_games[sniff_active_game];
 
-    // MD5 chumbado: string hex -> bytes
-    const char *h = SNIFF_ONLY_MD5;
+    memset(&cart_info, 0, sizeof(cart_info));
+    strncpy(cart_info.title, g->name, 21);
+    cart_info.title[21]       = '\0';
+    cart_info.header_valid    = true;
+    cart_info.is_hirom        = g->is_hirom != 0;
+    cart_info.is_ntsc         = g->is_ntsc != 0;
+    cart_info.sram_size_bytes = (uint32_t)g->sram_kb * 1024u;
+    sram_exp_window           = g->exp_sram != 0;
+
+    // MD5 da tabela: string hex -> bytes
     for (int i = 0; i < 16; i++) {
-        char b[3] = { h[i * 2], h[i * 2 + 1], '\0' };
+        char b[3] = { g->md5[i * 2], g->md5[i * 2 + 1], '\0' };
         cart_info.md5[i] = (uint8_t)strtol(b, NULL, 16);
     }
-    printf("SNIFF-ONLY: %s SRAM=%luKB md5=%s\n",
+    printf("SNIFF-ONLY [%u] %s: %s SRAM=%luKB md5=%s\n",
+           (unsigned)sniff_active_game, g->name,
            cart_info.is_hirom ? "HiROM" : "LoROM",
-           (unsigned long)(cart_info.sram_size_bytes / 1024), h);
+           (unsigned long)(cart_info.sram_size_bytes / 1024), g->md5);
 }
 #endif
 
@@ -813,7 +887,7 @@ static void sniff_fill_cart_info(void) {
  * Returns true if a valid SNES header was found.
  */
 static bool cart_id_phase(void) {
-#ifdef SNIFF_ONLY_MD5
+#ifdef SNIFF_ONLY_MODE
     // Sniff-only: NAO tocar no barramento. cart_info ja foi preenchida no
     // boot; so reafirma para o caso de um READ_CART repetido.
     sniff_fill_cart_info();
@@ -901,7 +975,7 @@ static bool cart_id_phase(void) {
 
     cart_drive_bus_release();
     return true;
-#endif  // SNIFF_ONLY_MD5
+#endif  // SNIFF_ONLY_MODE
 }
 
 /**
@@ -949,10 +1023,61 @@ static void release_snes(void) {
 //     RESET                              force Pico reboot via watchdog
 
 #define BAUD_RATE          115200
-#define SERIAL_BUFFER_SIZE 65536
+
+// Fase A: 96KB estaticos p/ o payload do patch. Orcamento (520KB total):
+// espelhos 160K + serial 96K + rings ~30K = BSS ~292K, sobrando ~215K de
+// heap p/ o parse do rcheevos -- protegido pelo filter_large_memaddr()
+// (ideia do NES v1.3, com stub corrigido: "1=0" nunca-verdadeiro; o "0=0"
+// original do NES e' SEMPRE-verdadeiro e daria award falso em hardcore!).
+#define SERIAL_BUFFER_SIZE 98304
 
 static uint8_t serial_buffer[SERIAL_BUFFER_SIZE];
 static uint8_t *serial_buffer_head = serial_buffer;
+
+// Triggers com MemAddr acima disso sao stubados para "1=0" antes do parse
+// (aparecem na lista, nunca disparam). 4KB corta os 8 "monstros" do SMW
+// (4.8-9.6KB de logica cada, ~150KB+ de heap se parseados) e preserva
+// todo o resto.
+#define MAX_MEMADDR_LEN 4096
+
+/**
+ * Varre o JSON do patch e substitui valores de "MemAddr" maiores que
+ * MAX_MEMADDR_LEN por "1=0", deslocando o restante in-place.
+ * Retorna o novo tamanho (string continua NUL-terminada).
+ */
+static size_t filter_large_memaddr(char *json, size_t len) {
+    const char  *needle = "\"MemAddr\":\"";
+    const size_t needle_len = 11;
+    char *pos = json;
+
+    for (;;) {
+        char *found = strstr(pos, needle);
+        if (!found) break;
+
+        char *v_start  = found + needle_len;
+        char *v_end    = v_start;
+        char *json_end = json + len;
+
+        while (v_end < json_end && *v_end != '"') {
+            if (*v_end == '\\') v_end++;    // pula escapes
+            v_end++;
+        }
+        if (v_end >= json_end) break;
+
+        size_t v_len = (size_t)(v_end - v_start);
+        if (v_len > MAX_MEMADDR_LEN) {
+            printf("[filter] MemAddr de %u bytes -> stub 1=0\n",
+                   (unsigned)v_len);
+            memmove(v_start + 3, v_end, (size_t)(json_end - v_end) + 1);
+            memcpy(v_start, "1=0", 3);
+            len -= (v_len - 3);
+            pos = v_start + 4;
+        } else {
+            pos = v_end + 1;
+        }
+    }
+    return len;
+}
 
 static inline bool prefix(const char *pre, const char *str) {
     return strncmp(pre, str, strlen(pre)) == 0;
@@ -1096,6 +1221,42 @@ static uint32_t qry_sram_addr[QRY_SRAM_MAX];
 static uint8_t  qry_sram_n;
 static uint32_t qry_calls, qry_sram_calls;
 
+// --- Snapshot atomico dos enderecos de interesse (ideia do odelot) ----------
+//
+// O do_frame lia o espelho VIVO enquanto o core1 segue escrevendo: as N
+// condicoes de um achievement eram avaliadas sobre instantes ligeiramente
+// diferentes (tearing) -- conjuncoes multi-endereco (ex.: Peppy Special:
+// 0x1503 + 0x33A + 0xA05A no MESMO frame) podiam nunca fechar. Agora o
+// read_memory APRENDE quais bytes o set consulta (1o frame serve vivo e
+// registra) e, no inicio de CADA do_frame, snapshot_refresh() congela uma
+// copia deles -- a avaliacao inteira enxerga UM instante unico, como num
+// emulador. PEEK/WATCH continuam lendo o espelho vivo (in_do_frame gate).
+// Snapshot NAO filtra escrita-lixo (isso e' solda/ruido) -- elimina apenas
+// a incoerencia temporal.
+// FF6 (115 achievements) consultou 944 bytes unicos = 92% de 1024 ->
+// dobrado p/ folga (+5KB de BSS). Acima do teto, bytes excedentes leem o
+// espelho vivo (sem atomicidade) silenciosamente -- vigiar "snapshot=" no
+// DBG em sets grandes.
+#define SNAP_MAX 2048
+static uint32_t snap_addr[SNAP_MAX];
+static uint8_t  snap_val[SNAP_MAX];
+static volatile uint16_t snap_count;
+static bool     in_do_frame;      // gate: snapshot so' vale p/ o rcheevos
+
+static inline uint8_t mirror_read_byte(uint32_t a) {
+    if (a < WRAM_MIRROR_SIZE) return wram_mirror[a];
+    if (a >= RCHEEVOS_SRAM_BASE && a < RCHEEVOS_SRAM_BASE + SRAM_MIRROR_SIZE)
+        return sram_mirror[a - RCHEEVOS_SRAM_BASE];
+    return 0;
+}
+
+/** Congela os bytes aprendidos (chamado imediatamente antes do do_frame). */
+static void snapshot_refresh(void) {
+    uint16_t n = snap_count;
+    for (uint16_t i = 0; i < n; i++)
+        snap_val[i] = mirror_read_byte(snap_addr[i]);
+}
+
 static uint32_t read_memory(uint32_t address, uint8_t *buffer,
                             uint32_t num_bytes, rc_client_t *client) {
     (void)client;
@@ -1111,13 +1272,23 @@ static uint32_t read_memory(uint32_t address, uint8_t *buffer,
     }
     for (uint32_t i = 0; i < num_bytes; i++) {
         uint32_t a = address + i;
-        if (a < WRAM_MIRROR_SIZE) {
-            buffer[i] = wram_mirror[a];
-        } else if (a >= RCHEEVOS_SRAM_BASE &&
-                   a < RCHEEVOS_SRAM_BASE + SRAM_MIRROR_SIZE) {
-            buffer[i] = sram_mirror[a - RCHEEVOS_SRAM_BASE];
+        if (in_do_frame) {
+            // Serve do snapshot congelado; miss = 1a consulta deste byte:
+            // serve vivo e registra p/ entrar no proximo refresh.
+            uint16_t k;
+            for (k = 0; k < snap_count; k++) {
+                if (snap_addr[k] == a) { buffer[i] = snap_val[k]; break; }
+            }
+            if (k == snap_count) {
+                buffer[i] = mirror_read_byte(a);
+                if (snap_count < SNAP_MAX) {
+                    snap_addr[snap_count] = a;
+                    snap_val[snap_count]  = buffer[i];
+                    snap_count++;
+                }
+            }
         } else {
-            buffer[i] = 0;
+            buffer[i] = mirror_read_byte(a);   // PEEK/WATCH: espelho vivo
         }
     }
     return num_bytes;
@@ -1407,14 +1578,33 @@ static void handle_resp(const char *cmd) {
 
     if (request_ongoing) request_ongoing--;
 
+    size_t body_len = strlen(p);
+
     // Telemetria de bring-up: tamanho do corpo recebido (truncamento de
     // payload grande aparece aqui na hora).
-    printf("[resp] id=%02X http=%u len=%u\n", id, http, (unsigned)strlen(p));
+    printf("[resp] id=%02X http=%u len=%u\n", id, http, (unsigned)body_len);
+
+    // Payload grande = provavelmente o patch: stub-a triggers gigantes
+    // antes do parse (protege a heap) e mede o custo real do rcheevos.
+    bool big = body_len > 8192;
+    if (big) {
+        // o buffer subjacente e' o serial_buffer (mutavel); o const vem
+        // so da assinatura do handler
+        body_len = filter_large_memaddr((char *)p, body_len);
+        struct mallinfo mi = mallinfo();
+        printf("[heap] antes do parse: usado=%d livre=%d\n",
+               mi.uordblks, mi.fordblks);
+    }
 
     for (int i = 0; i < MAX_ASYNC_CALLBACKS; i++) {
         if (async_handlers[i].id == id) {
             async_cb_t copy = async_handlers[i].data;
-            http_callback(http, p, strlen(p), &copy, NULL);
+            http_callback(http, p, body_len, &copy, NULL);
+            if (big) {
+                struct mallinfo mi = mallinfo();
+                printf("[heap] depois do parse: usado=%d livre=%d\n",
+                       mi.uordblks, mi.fordblks);
+            }
             return;
         }
     }
@@ -1463,6 +1653,18 @@ static bool     vsync_on = true;
 static uint32_t vsync_seen;
 static volatile uint32_t frames_vb, frames_timer;   // telemetria
 
+/**
+ * Avaliacao ATOMICA: congela o snapshot dos enderecos de interesse e roda o
+ * do_frame servindo leituras dele (gate in_do_frame) -- o rcheevos enxerga
+ * um instante unico do espelho, sem tearing do core1 escrevendo no meio.
+ */
+static void do_frame_atomic(void) {
+    snapshot_refresh();
+    in_do_frame = true;
+    rc_client_do_frame(g_client);
+    in_do_frame = false;
+}
+
 static void maybe_do_frame(void) {
     if (state != 8) return;
     uint64_t now = time_us_64();
@@ -1473,11 +1675,11 @@ static void maybe_do_frame(void) {
             vsync_seen = vc;
             last_frame_us = now;
             frames_vb++;
-            rc_client_do_frame(g_client);
+            do_frame_atomic();
         } else if (now - last_frame_us >= 25000) {
             last_frame_us = now;
             frames_timer++;
-            rc_client_do_frame(g_client);
+            do_frame_atomic();
         }
         return;
     }
@@ -1487,7 +1689,7 @@ static void maybe_do_frame(void) {
     if (now - last_frame_us >= frame_us) {
         last_frame_us = now;
         frames_timer++;
-        rc_client_do_frame(g_client);
+        do_frame_atomic();
     }
 }
 
@@ -1535,6 +1737,53 @@ static inline uint32_t __not_in_flash_func(addr_fix)(uint32_t a) {
 // Telemetria p/ DBG: escritas efetivamente aplicadas em cada espelho.
 static volatile uint32_t stat_wram_commit, stat_cart_commit, stat_bport_commit;
 
+// --- Resolucao de bank da WRAM via A22 (GP29) --------------------------------
+// A22 desfaz a ambiguidade mirror vs $7E/$7F direto (a colisao $7F:0000-1FFF
+// vs mirror de bank impar). Por PADRAO a resolucao e' SEMPRE exata: se o fio
+// do A22 estiver ruim, isso APARECE (missample>0 no DBG + captura errada nos
+// testes), em vez de ser silenciosamente mascarado.
+//
+// WRAM_BANK_FALLBACK (opt-in, default DESLIGADO): reativa o auto-detect do fio
+// com rede de double-write, para um chicote SEM o fio do A22. Fica off de
+// proposito -- uma rede silenciosa esconde uma solda ruim atras de "ta quase
+// funcionando", que e' PIOR do que falhar alto. So ligue se souber que aquele
+// hardware nao tem o A22 e voce aceita o veneno do double-write.
+// #define WRAM_BANK_FALLBACK
+typedef enum { BANKPAIR_EXACT = 0, BANKPAIR_PROBING, BANKPAIR_FALLBACK } bankpair_mode_t;
+#ifdef WRAM_BANK_FALLBACK
+// FORCADO em double-write: NUNCA le o GP29, NUNCA se auto-promove a EXACT.
+// (A 1a versao bootava em PROBING e, com o fio lendo 1 nos acessos diretos,
+// se promovia sozinha a EXACT em 64 escritas -- o "teste DW" de 15:21 rodou
+// EXACT sem querer e invalidou o experimento de isolamento. Licao: build de
+// isolamento nao pode ter caminho de promocao.)
+static volatile uint8_t  bankpair_mode = BANKPAIR_FALLBACK;
+static volatile uint32_t bankpair_confirms;   // morto (probe nunca roda)
+#define BANKPAIR_CONFIRM_TARGET 64u
+#else
+static volatile uint8_t  bankpair_mode = BANKPAIR_EXACT;    // confia no A22, falha alto
+#endif
+// Missample: mirror (A22=0) com offset >= 0x2000 e' impossivel -> A22 falhou
+// a amostra. SEMPRE contado -- e' o velocimetro da saude do fio no DBG
+// (>0 sustentado = reflow no GP29/slot 47). No modo exato tratamos como direto.
+static volatile uint32_t stat_a22_missample;
+
+// Censo de classes de escrita na WRAM (auditoria do mirror no DBG). Cada
+// jogo tem uma "assinatura" esperada:
+//   - mirror  > 0 SEMPRE (pagina-zero/pilha vivem nos 8KB baixos via mirror);
+//   - SMW: mirror dominante, dir7F ~0;
+//   - Star Fox: dir7F alto (scratch do SuperFX) e SEPARADO do mirror.
+// Absurdos denunciam bug/fio: mirror=0 e' impossivel; dir7F enorme no SMW
+// e' suspeito; missample>0 = fio do A22.
+//
+// dir7f_lo e' O DISCRIMINADOR da "mentira para cima" do A22 (ler 1 numa
+// escrita de mirror -- a direcao que o missample NAO enxerga): assinatura
+// (A22=1, A16=1, offset<0x2000) = escrita direta em $7F:0000-1FFF. No SMW
+// isso e' ~zero (ele nao usa $7F baixo); se aparecer aos MILHARES, sao
+// mirrors de bank impar sendo desviados => o fio NAO carrega o A22 real
+// (A17/A18/A19? solda no pino errado / ponte com vizinho no slot 47).
+static volatile uint32_t stat_wram_dir7e, stat_wram_dir7f_lo,
+                         stat_wram_dir7f_hi, stat_wram_mirror_w;
+
 // GREP=<addr>: conta capturas comitadas num endereco especifico, separadas
 // por origem (A-bus vs porta $2180). Distingue "o jogo nao escreve ai do
 // jeito que enxergamos" de "escreve mas o espelho/leitura erra".
@@ -1544,6 +1793,11 @@ static volatile uint32_t grep_hits_raw;    // match no addr ANTES da validacao
 static volatile uint32_t grep_hits_wram, grep_hits_bport;
 static volatile uint8_t  grep_last_wram, grep_last_bport;
 static volatile uint32_t grep_last_raw_word;   // palavra crua do ultimo match
+// Rastreador de COMMITS: ring das ultimas 8 palavras cruas que efetivamente
+// ESCREVERAM no endereco do GREP -- identifica o "vandalo" que pisoteia um
+// byte (endereco capturado + dado + a22 + a16 de cada escrita, no DBG).
+static volatile uint32_t grep_commit_ring[8];
+static volatile uint8_t  grep_commit_idx;
 
 // Log dos ultimos eventos da porta $2180-83 (diagnostico do ponteiro-sombra):
 //   set_log: escritas em $2181/82/83 -> (port<<25)|(data<<17)|ponteiro_apos
@@ -1559,38 +1813,93 @@ static void __not_in_flash_func(consume_wram_word)(uint32_t w) {
         grep_hits_raw++;                 // capturado, ainda sem validacao
         grep_last_raw_word = w;
     }
+    // /WR e /WRAM validados na propria palavra: descarta leitura de WRAM
+    // (/WR alto) e falsos gatilhos onde /WRAM ja subiu. So escrita passa.
     if (LOW_WRAM_N(w) || LOW_WR_N(w)) return;
     uint32_t a = addr_fix(LOW_ADDR(w));
     uint8_t  d = (uint8_t)LOW_DATA(w);
 
-    // MIRRORING de WRAM: banks 00-3F/80-BF espelham os primeiros 8KB em
-    // $0000-1FFF. Um write com DBR de bit0=1 (ex.: $01:0DC1) chega com
-    // A16=1 -> endereco cru 0x10DC1, mas o alvo real e' 0x00DC1. Com so
-    // A0-A16 nao da p/ distinguir esse caso de $7F:0000-1FFF legitimo
-    // (mesma assinatura), entao gravamos nos DOIS candidatos. Resolucao
-    // exata = 1 fio extra: A22 (slot 47 -> GP37/W24): /WRAM & A22=1 ->
-    // 7E/7F direto; A22=0 -> mirror. TODO fase 5b.
-    if (a >= 0x10000u && (a & 0xFFFFu) < 0x2000u) {
+#ifdef WRAM_BANK_FALLBACK
+    // Prova do fio A22 (escrita inequivocamente direta: offset >= 0x2000).
+    // So existe no modo com rede -- por padrao ja entramos direto em EXACT.
+    if (bankpair_mode == BANKPAIR_PROBING && (a & 0xFFFFu) >= 0x2000u) {
+        if (LOW_A22(w)) {
+            if (++bankpair_confirms >= BANKPAIR_CONFIRM_TARGET)
+                bankpair_mode = BANKPAIR_EXACT;
+        } else {
+            bankpair_mode = BANKPAIR_FALLBACK;   // pull-down leu 0: fio ausente
+        }
+    }
+#endif
+
+    if (bankpair_mode == BANKPAIR_EXACT) {
+        // Resolucao exata pelo A22 (caminho PADRAO).
+        uint32_t target;
+        if (LOW_A22(w)) {
+            target = a;                    // $7E/$7F direto (A16 e' o bit16)
+            if (a >= 0x10000u) {
+                if ((a & 0xFFFFu) < 0x2000u) stat_wram_dir7f_lo++;
+                else                         stat_wram_dir7f_hi++;
+            } else {
+                stat_wram_dir7e++;
+            }
+        } else if ((a & 0xFFFFu) < 0x2000u) {
+            target = a & 0x1FFFu;          // mirror -> sempre $7E baixo
+            stat_wram_mirror_w++;
+        } else {
+            stat_a22_missample++;          // mirror c/ off>=2000 e' impossivel:
+            target = a;                    // fio falhou -> trata direto e DENUNCIA
+        }
+        wram_mirror[target] = d;
+        if (target == grep_addr) {
+            grep_hits_wram++; grep_last_wram = d;
+            grep_commit_ring[grep_commit_idx++ & 7u] = w;
+        }
+    }
+#ifdef WRAM_BANK_FALLBACK
+    else if (a >= 0x10000u && (a & 0xFFFFu) < 0x2000u) {
+        // FALLBACK (fio ausente): double-write nos dois candidatos. O "lixo"
+        // do $7F fica em 0x1xxxx, so lido se um achievement ler $7F.
         uint32_t off = a & 0x1FFFu;
         wram_mirror[off]            = d;
         wram_mirror[0x10000u | off] = d;
         if (off == grep_addr || (0x10000u | off) == grep_addr) {
             grep_hits_wram++; grep_last_wram = d;
+            grep_commit_ring[grep_commit_idx++ & 7u] = w;
         }
-    } else {
+    }
+#endif
+    else {
+        // Escrita inequivoca (a<0x10000, ou offset>=0x2000 no modo com rede).
         wram_mirror[a] = d;
-        if (a == grep_addr) { grep_hits_wram++; grep_last_wram = d; }
+        if (a == grep_addr) {
+            grep_hits_wram++; grep_last_wram = d;
+            grep_commit_ring[grep_commit_idx++ & 7u] = w;
+        }
     }
     stat_wram_commit++;
     if (!flag_bus_written) flag_bus_written = true;
 }
+
+// Escritas de cart VALIDADAS (controles ok) que a janela de SRAM rejeitou:
+// separa "nenhuma escrita real chegou" de "chegou mas o filtro descartou"
+// (caso SMK/DSP boards: a SRAM pode viver numa janela fora do padrao LoROM).
+// O ring guarda as ultimas 8 palavras rejeitadas -- o DBG mostra ONDE o jogo
+// realmente escreve, e ai ajustamos a janela com dado, nao com palpite.
+static volatile uint32_t stat_cart_reject;
+static volatile uint32_t cart_reject_ring[8];
+static volatile uint8_t  cart_reject_idx;
 
 static void __not_in_flash_func(consume_cart_word)(uint32_t w) {
     if (LOW_CART_N(w) || LOW_WR_N(w)) return;
     uint32_t sram_off = bus_to_sram_offset(addr_fix(LOW_ADDR(w)),
                                            cart_info.is_hirom,
                                            cart_info.sram_size_bytes);
-    if (sram_off == BUS_NOT_SRAM || sram_off >= SRAM_MIRROR_SIZE) return;
+    if (sram_off == BUS_NOT_SRAM || sram_off >= SRAM_MIRROR_SIZE) {
+        stat_cart_reject++;
+        cart_reject_ring[cart_reject_idx++ & 7u] = w;
+        return;
+    }
     sram_mirror[sram_off] = (uint8_t)LOW_DATA(w);
     if ((RCHEEVOS_SRAM_BASE + sram_off) == grep_addr) {
         grep_hits_wram++;                 // origem A-bus (cart)
@@ -1611,11 +1920,59 @@ static void __not_in_flash_func(consume_cart_word)(uint32_t w) {
 // do caminho LoROM.
 static volatile uint32_t stat_hisram_commit;
 
+// Sonda da janela de expansao $6000-7FFF (INDEPENDENTE do mapa): escritas
+// validas (/WRAM=1, /WR=0) nessa janela que NAO viram commit -- e' onde
+// vivem SRAM de HiROM (ja tratada), registradores de DSP (DR/SR) e SRAMs
+// de boards especiais (caso SMK/1K1B: save nao aparece nem no /CART nem
+// aqui?). Contador + ring dos ultimos 8 addr=dado no DBG: no save do SMK,
+// se o contador pular e o ring mostrar offsets $6xxx-7xxx, achamos a
+// janela real e mapeamos com dado, nao palpite.
+// Split da janela (medido no SMK, 14/jul): o DSP-1 conversa em $6000/$6001
+// a ~2k escritas/s e AFOGA um ring unico. $6000-6FFF vira so contador
+// (DSP DR); $7000-7FFF ganha contador + ring proprios — nessa metade o
+// DSP nao escreve (SR e' so leitura), entao o ring fica MUDO ate um save
+// de SRAM aparecer (hipotese 1K1B: SRAM em $7000-77FF).
+// Split 2 (14/jul): o DSP DR observado usa SO $6000/$6001 — separa esses
+// dois enderecos do resto: qualquer escrita em $6002-6FFF (SRAM em bank
+// sobreposto ao DSP?) ganha ring proprio e aparece com addr=dado.
+static volatile uint32_t stat_exp_dsp;            // $6000/$6001 (DSP DR puro)
+static volatile uint32_t stat_exp_mid;            // $6002-6FFF (SRAM oculta?)
+static volatile uint32_t stat_exp_hi;             // $7000-7FFF (SRAM 1K1B?)
+// Rede final: offsets fora de TUDO -- $2200-3FFF e $4400-5FFF (acima dos
+// registradores B-bus/$21xx e CPU/$40xx-43xx, abaixo da expansao).
+// Escrita valida aqui = board decodificando SRAM em lugar exotico. Com
+// esta, TODO offset nao-WRAM < $8000 esta vigiado.
+static volatile uint32_t stat_exp_other;
+static volatile uint32_t exp_mid_ring[8], exp_hi_ring[8], exp_other_ring[8];
+static volatile uint8_t  exp_mid_idx, exp_hi_idx, exp_other_idx;
+
 static void __not_in_flash_func(consume_hisram_word)(uint32_t w) {
     if (!LOW_WRAM_N(w) || LOW_WR_N(w)) return;   // exige /WRAM=1 e /WR=0
-    if (!cart_info.is_hirom || cart_info.sram_size_bytes == 0) return;
+    {
+        uint32_t o16 = LOW_ADDR(w) & 0xFFFFu;
+        if (o16 == 0x6000u || o16 == 0x6001u) {
+            stat_exp_dsp++;
+        } else if (o16 >= 0x6002u && o16 < 0x7000u) {
+            stat_exp_mid++;
+            exp_mid_ring[exp_mid_idx++ & 7u] = w;
+        } else if (o16 >= 0x7000u && o16 < 0x8000u) {
+            stat_exp_hi++;
+            exp_hi_ring[exp_hi_idx++ & 7u] = w;
+        } else if ((o16 >= 0x2200u && o16 < 0x4000u) ||
+                   (o16 >= 0x4400u && o16 < 0x6000u)) {
+            stat_exp_other++;
+            exp_other_ring[exp_other_idx++ & 7u] = w;
+        }
+    }
+    if (!(cart_info.is_hirom || sram_exp_window) ||
+        cart_info.sram_size_bytes == 0) return;
     uint32_t off16 = LOW_ADDR(w) & 0xFFFFu;
     if (off16 < 0x6000u || off16 >= 0x8000u) return;   // fora da janela
+    // Board LoROM+DSP: $6000/$6001 sao o DR do DSP (banks baixos) -- nao
+    // mapear no espelho de SRAM (2 primeiros bytes ficam sem espelho;
+    // limitacao documentada, nenhum set conhecido le SRAM[0..1]).
+    if (sram_exp_window && !cart_info.is_hirom &&
+        (off16 == 0x6000u || off16 == 0x6001u)) return;
     uint32_t sram_off = off16 - 0x6000u;
     if (sram_off >= cart_info.sram_size_bytes || sram_off >= SRAM_MIRROR_SIZE)
         return;
@@ -1839,12 +2196,63 @@ static void debug_dump(void) {
     printf("[dbg] wram : dma=%lu rd=%lu words=%lu commits=%lu\n",
            (unsigned long)stream_wr_pos(&s_wram), (unsigned long)s_wram.rd,
            (unsigned long)s_wram.words, (unsigned long)stat_wram_commit);
-    printf("[dbg] cart : dma=%lu rd=%lu words=%lu commits=%lu\n",
+    printf("[dbg] cart : dma=%lu rd=%lu words=%lu commits=%lu rejeitados=%lu\n",
            (unsigned long)stream_wr_pos(&s_cart), (unsigned long)s_cart.rd,
-           (unsigned long)s_cart.words, (unsigned long)stat_cart_commit);
-    printf("[dbg] hisram: dma=%lu rd=%lu words=%lu commits=%lu (so HiROM)\n",
+           (unsigned long)s_cart.words, (unsigned long)stat_cart_commit,
+           (unsigned long)stat_cart_reject);
+    if (stat_cart_reject) {
+        // Escritas de cart validas que a janela de SRAM descartou: mostra
+        // ONDE o jogo escreve de verdade (caso SMK: janela fora do padrao?)
+        printf("[dbg] cart rejeitados (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = cart_reject_ring[(cart_reject_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    printf("[dbg] hisram: dma=%lu rd=%lu words=%lu commits=%lu (HiROM/expSRAM) "
+           "| DSP($6000/01): %lu | $6002-6FFF: %lu | $7000-7FFF: %lu\n",
            (unsigned long)stream_wr_pos(&s_hisram), (unsigned long)s_hisram.rd,
-           (unsigned long)s_hisram.words, (unsigned long)stat_hisram_commit);
+           (unsigned long)s_hisram.words, (unsigned long)stat_hisram_commit,
+           (unsigned long)stat_exp_dsp, (unsigned long)stat_exp_mid,
+           (unsigned long)stat_exp_hi);
+    if (stat_exp_mid) {
+        printf("[dbg] janela $6002-6FFF (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = exp_mid_ring[(exp_mid_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    if (stat_exp_hi) {
+        printf("[dbg] janela $7xxx (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = exp_hi_ring[(exp_hi_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    printf("[dbg] fora-de-tudo ($2200-3FFF/$4400-5FFF): %lu\n",
+           (unsigned long)stat_exp_other);
+    if (stat_exp_other) {
+        printf("[dbg] fora-de-tudo (addr=dado, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = exp_other_ring[(exp_other_idx - k) & 7u];
+            printf(" %05lX=%02lX",
+                   (unsigned long)LOW_ADDR(rw), (unsigned long)LOW_DATA(rw));
+        }
+        printf("\n");
+    }
+    // Bytes de trofeu do SMK (code notes 0x207F0-0x207FF): dump fixo do
+    // espelho -- se um save reescrever o bloco, eles aparecem aqui e devem
+    // bater com o esperado (ex.: Mushroom 50cc Gold = bit2 em 0x207F2).
+    printf("[dbg] sram 207F0-207FF:");
+    for (uint32_t i = 0x7F0; i <= 0x7FF; i++)
+        printf(" %02X", sram_mirror[i]);
+    printf("\n");
     printf("[dbg] bport: dma=%lu rd=%lu words=%lu commits=%lu\n",
            (unsigned long)stream_wr_pos(&s_bport), (unsigned long)s_bport.rd,
            (unsigned long)s_bport.words, (unsigned long)stat_bport_commit);
@@ -1961,6 +2369,34 @@ static void debug_dump(void) {
                             PIO_SM0_PINCTRL_IN_BASE_BITS)
                            >> PIO_SM0_PINCTRL_IN_BASE_LSB));
 
+    // --- 11b. resolucao de bank via A22 (mirror vs $7E/$7F direto) ---
+    // ordem casa com o enum: EXACT=0, PROBING=1, FALLBACK=2
+    static const char *bp_names[] = { "EXACT", "PROBING", "FALLBACK" };
+    printf("[dbg] bankpair=%s missample=%lu A22(GP29)=%d | classes: "
+           "dir7E=%lu dir7F_lo=%lu dir7F_hi=%lu mirror=%lu\n",
+           bp_names[bankpair_mode],
+           (unsigned long)stat_a22_missample, gpio_get(SNES_RD_N),
+           (unsigned long)stat_wram_dir7e,
+           (unsigned long)stat_wram_dir7f_lo,
+           (unsigned long)stat_wram_dir7f_hi,
+           (unsigned long)stat_wram_mirror_w);
+    printf("[dbg]   (SMW ground truth: dir7F_lo~0. Aos milhares = fio do "
+           "A22 mentindo p/ cima -> mirrors de bank impar desviados)\n");
+
+    // --- 11c. rastreador de commits do GREP: quem escreveu no endereco ---
+    if (grep_addr != GREP_DISABLED) {
+        printf("[dbg] grep commits (addr=dado a22.a16, recentes):");
+        for (uint32_t k = 1; k <= 8; k++) {
+            uint32_t rw = grep_commit_ring[(grep_commit_idx - k) & 7u];
+            printf(" %05lX=%02lX %lu.%lu",
+                   (unsigned long)LOW_ADDR(rw),
+                   (unsigned long)LOW_DATA(rw),
+                   (unsigned long)LOW_A22(rw),
+                   (unsigned long)((rw >> 16) & 1u));
+        }
+        printf("\n");
+    }
+
     // --- 12. espelho de SRAM: bytes != 0 (enderecos ja em espaco rcheevos) ---
     uint32_t snz = 0, sshown = 0;
     printf("[dbg] espelho SRAM != 0:");
@@ -1977,9 +2413,10 @@ static void debug_dump(void) {
     printf(" (total %lu bytes)\n", (unsigned long)snz);
 
     // --- 11. enderecos que o rcheevos consulta (rastreio passivo) ---
-    printf("[dbg] rc queries: total=%lu sram=%lu | sram unicos=%u:",
+    printf("[dbg] rc queries: total=%lu sram=%lu snapshot=%u bytes | "
+           "sram unicos=%u:",
            (unsigned long)qry_calls, (unsigned long)qry_sram_calls,
-           (unsigned)qry_sram_n);
+           (unsigned)snap_count, (unsigned)qry_sram_n);
     for (uint8_t k = 0; k < qry_sram_n; k++) {
         printf(" %05lX=%02X", (unsigned long)qry_sram_addr[k],
                sram_mirror[qry_sram_addr[k] - RCHEEVOS_SRAM_BASE]);
@@ -1994,6 +2431,54 @@ static void debug_dump(void) {
            (unsigned long)vb_anom, (unsigned long)vb_last_len,
            vsync_on ? "ON" : "off",
            (unsigned long)frames_vb, (unsigned long)frames_timer);
+}
+
+// =============================================================================
+// Deteccao de RESET do console (tap /RESET no GP43)
+// =============================================================================
+//
+// Quando o usuario aperta reset (ou liga o console depois do Pico), o jogo
+// recomeca do zero mas os espelhos e o estado do rcheevos ficam PODRES --
+// hit counts, deltas e valores antigos podem gerar trigger falso. Aqui:
+// /RESET precisa ficar ALTO por 500ms para ARMAR (garante que o fio existe
+// e o console roda -- GP43 flutuando em 0 nunca arma, entao sem o fio a
+// feature fica dormente). Depois de armado, /RESET em 0 por >30ms = reset
+// real -> limpa espelhos, rc_client_reset() (API do rcheevos exatamente
+// para isso: zera hits/estado, preserva unlocks) e avisa o ESP32.
+//
+// Feature que o adaptador NES nao tem ("console RESET detection is not
+// yet implemented" no README de la desde sempre).
+
+static void maybe_detect_console_reset(void) {
+    static uint32_t last_ms, high_ms, low_ms;
+    static bool armed;
+
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now == last_ms) return;                 // amostra ~1x por ms
+    uint32_t dt = now - last_ms;
+    last_ms = now;
+
+    if (gpio_get(SNES_RESET_N)) {
+        high_ms += dt;
+        low_ms = 0;
+        if (!armed && high_ms > 500) {
+            armed = true;
+            printf("[reset] deteccao armada (fio do /RESET presente)\n");
+        }
+    } else {
+        low_ms += dt;
+        high_ms = 0;
+        if (armed && low_ms > 30) {
+            armed = false;                      // re-arma quando voltar a ALTO
+            printf("[reset] console resetado -> espelhos limpos + rc_client_reset\n");
+            mirrors_reset();
+            wm_pointer = 0;
+            if (g_client != NULL && state == 8) {
+                rc_client_reset(g_client);
+            }
+            uart_send("SNES_RESETED\r\n");      // ESP32 redesenha a UI
+        }
+    }
 }
 
 // =============================================================================
@@ -2017,12 +2502,13 @@ static void maybe_print_usb_banner(void) {
         printf("addr-fix ATIVO: A%d<->A%d destrocados por software\n",
                ADDR_FIX_SWAP_A, ADDR_FIX_SWAP_B);
 #endif
-#ifdef SNIFF_ONLY_MD5
-        printf("modo: SNIFF-ONLY (md5 chumbado, captura armada, nenhum pino dirigido)\n");
-        printf("cart: %s SRAM=%luKB md5=%s\n",
+#ifdef SNIFF_ONLY_MODE
+        printf("modo: SNIFF-ONLY (tabela de jogos, captura armada, nenhum pino dirigido)\n");
+        printf("jogo ativo [%u]: %s (%s, SRAM=%luKB) -- GAME? lista, GAME=<n> troca\n",
+               (unsigned)sniff_active_game,
+               sniff_games[sniff_active_game].name,
                cart_info.is_hirom ? "HiROM" : "LoROM",
-               (unsigned long)(cart_info.sram_size_bytes / 1024),
-               SNIFF_ONLY_MD5);
+               (unsigned long)(cart_info.sram_size_bytes / 1024));
 #else
         printf("modo: normal (isolamento %s) -- aguardando READ_CART\n",
 #ifdef BUS_SWITCH_4066
@@ -2036,7 +2522,8 @@ static void maybe_print_usb_banner(void) {
                (unsigned)state, capture_started ? "ON" : "off",
                (unsigned long)to_ms_since_boot(get_absolute_time()));
         printf("comandos: SYNC | DBG | READ_CART | PEEK=<addr hex> | "
-               "WATCH=<addr hex>|OFF | RESET\n\n");
+               "WATCH=<addr hex>|OFF | VSYNC=ON|OFF | GREP=<addr>|OFF | "
+               "GAME? | GAME=<n> | RESETSNES | RESET\n\n");
     }
     usb_was_connected = now;
 }
@@ -2048,10 +2535,17 @@ static void maybe_grep(void) {
     if (grep_addr == GREP_DISABLED) return;
     uint32_t hw = grep_hits_wram, hb = grep_hits_bport;
     if (hw != grep_seen_wram || hb != grep_seen_bport) {
-        printf("[grep] %05lX: wram hits=%lu last=%02X | bport hits=%lu last=%02X\n",
+        // raw = ultima palavra crua que casou o endereco (pre-validacao):
+        // a22/a16 dizem a CLASSE da escrita (direto $7E/$7F vs mirror).
+        uint32_t rw = grep_last_raw_word;
+        printf("[grep] %05lX: wram hits=%lu last=%02X | bport hits=%lu "
+               "last=%02X | raw=%08lX a22=%lu a16=%lu\n",
                (unsigned long)grep_addr,
                (unsigned long)hw, grep_last_wram,
-               (unsigned long)hb, grep_last_bport);
+               (unsigned long)hb, grep_last_bport,
+               (unsigned long)rw,
+               (unsigned long)LOW_A22(rw),
+               (unsigned long)((rw >> 16) & 1u));
         grep_seen_wram = hw; grep_seen_bport = hb;
         sleep_ms(50);   // limita a ~20 prints/s se o endereco for quente
     }
@@ -2158,6 +2652,40 @@ static void process_serial_command(char *command) {
     } else if (prefix("DBG", command)) {
         debug_dump();
 
+#ifdef SNIFF_ONLY_MODE
+    } else if (prefix("GAME?", command)) {
+        printf("[game] tabela (GAME=<n> troca, persiste e reinicia):\n");
+        for (uint32_t i = 0; i < SNIFF_GAME_COUNT; i++) {
+            printf("  %lu%c %-22s %s SRAM=%uKB\n",
+                   (unsigned long)i, i == sniff_active_game ? '*' : ' ',
+                   sniff_games[i].name,
+                   sniff_games[i].is_hirom ? "HiROM" : "LoROM",
+                   sniff_games[i].sram_kb);
+        }
+
+    } else if (prefix("GAME=", command)) {
+        uint32_t n = (uint32_t)strtoul(command + 5, NULL, 10);
+        if (n < SNIFF_GAME_COUNT) {
+            printf("[game] trocando para [%lu] %s -- persistindo e reiniciando...\n",
+                   (unsigned long)n, sniff_games[n].name);
+            sleep_ms(50);   // deixa o printf sair antes do reboot
+            watchdog_hw->scratch[0] = GAME_SLOT_MAGIC;
+            watchdog_hw->scratch[1] = n;
+            watchdog_reboot(0, 0, 0);
+        } else {
+            printf("[game] indice invalido (0-%lu)\n",
+                   (unsigned long)(SNIFF_GAME_COUNT - 1));
+        }
+#endif
+
+    } else if (prefix("RESETSNES", command)) {
+        // Reset forcado do CONSOLE via Q1 (GP44 -> R2 -> base). No chicote
+        // sem Q1 e' um no-op inofensivo (GP44 esta no ar).
+        printf("[reset] pulso de reset no console via Q1 (150ms)\n");
+        gpio_put(SNES_RESET_DRIVE, 1);
+        sleep_ms(150);
+        gpio_put(SNES_RESET_DRIVE, 0);
+
     } else if (prefix("RESET", command)) {
         watchdog_reboot(0, 0, 0);
 
@@ -2241,6 +2769,12 @@ int main(void) {
     stdio_init_all();
     setup_uart();
 
+#ifdef SNIFF_ONLY_MODE
+    // Persistencia do jogo ativo: PRECISA rodar antes do core1 nascer --
+    // flash_range_erase com codigo XIP executando no outro core = hardfault.
+    game_slot_boot_init();
+#endif
+
     mirrors_reset();
     ach_fifo_init(&ach_fifo);
 
@@ -2249,11 +2783,11 @@ int main(void) {
     multicore_launch_core1(core1_main);
     sleep_ms(250);    // folga p/ core1 iniciar e bloquear no mutex
 
-#ifdef SNIFF_ONLY_MD5
-    // Sniff-only: cart_info chumbada e captura armada desde o boot -- o
+#ifdef SNIFF_ONLY_MODE
+    // Sniff-only: cart_info vem da tabela e captura armada desde o boot -- o
     // console roda livre (sem switches, sem Q1). PEEK=/WATCH= ja funcionam
     // pelo USB; READ_CART/START_WATCH seguem o fluxo normal com o MD5
-    // chumbado, caso o ESP32 esteja conectado.
+    // da tabela, caso o ESP32 esteja conectado.
     sniff_fill_cart_info();
     start_capture_once();
     printf("[BOOT] SNIFF-ONLY: captura armada, nenhum pino sera dirigido\n");
@@ -2275,6 +2809,7 @@ int main(void) {
         maybe_print_usb_banner();
         maybe_watch();         // WATCH=<addr>: imprime mudancas no espelho
         maybe_grep();          // GREP=<addr>: contadores de captura
+        maybe_detect_console_reset();   // botao de reset do console (GP43)
 
         // ---- Cart-ID phase (gated on ESP32's READ_CART command) ----
         //
