@@ -1,4 +1,5 @@
 build
-build_tests
-build_pico
+/build_tests
+/build_pico
+/build_pcb
 unity-app

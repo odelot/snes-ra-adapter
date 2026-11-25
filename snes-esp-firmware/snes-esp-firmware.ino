@@ -21,11 +21,13 @@
    (via 74HCT245 transceivers and a Q1 NPN that drives /RESET), so the ESP32 owns
    no analog-switch / OE control pin.
 
-   Date:             2026-05-15
-   Version:          0.1-snes
+   Date:             2026-11-23
+   Version:          0.2-snes
    By odelot
 
    Arduino IDE ESP32 Boards: v3.0.7
+   Boards: ESP32-C3 Super Mini (proto v0.1-v0.3) or Waveshare ESP32-S3-Zero (v0.4+),
+   picked at compile time from the selected chip (see SNES_BOARD_REV)
 
    Libs used:
    WifiManager: https://github.com/tzapu/WiFiManager v2.0.17
@@ -62,14 +64,16 @@
  * remember: you need to deploy the lambda and inform its URL
  */
 
-#define ENABLE_SHRINK_LAMBDA 1 // 0 - disable / 1 - enable
-#define SHRINK_LAMBDA_URL "https://xxxxxxxxx.execute-api.us-east-1.amazonaws.com/default/NES_RA_ADAPTER?"
-
+#define ENABLE_SHRINK_LAMBDA 0 // 0 - disable / 1 - enable
+#define SHRINK_LAMBDA_URL "https://xxxxxxxxxx.execute-api.xx-xxxx-x.amazonaws.com/default/RA?"
 /**
- enable internal web app (comment to disable)
+ enable the LAN web portal (comment to disable): http://snes-ra-adapter.local/
+ live achievement list + unlock toasts over WebSocket, theme switch (LCD +
+ portal, saved in EEPROM) and a hidden debug view. Needs the data folder
+ uploaded to LittleFS (see README). Without it only the /game page is served.
 */
 
-//#define ENABLE_INTERNAL_WEB_APP_SUPPORT
+#define ENABLE_INTERNAL_WEB_APP_SUPPORT
 
 /**
 * enable LCD (comment to disable)
@@ -77,9 +81,9 @@
 #define ENABLE_LCD
 
 /**
-* flip screen upside down
+* flip screen upside down (protoboard mounting; the PCBs need it off)
 */
-#define FLIP_SCREEN
+// #define FLIP_SCREEN
 
 #include <WiFiManager.h>
 #include <new> // std::nothrow
@@ -107,6 +111,9 @@
   #include <TFT_eSPI.h>
 #endif
 
+// from here on "Serial" also feeds the portal's debug log (no-op without the portal)
+#include "serial_tee.h"
+
 #define VERSION "1.1"
 
 /**
@@ -122,6 +129,35 @@
 #define EEPROM_SIZE 256
 #define EEPROM_ID_1 142
 #define EEPROM_ID_2 208
+// last byte: LCD/portal theme, stored as EEPROM_THEME_TAG | index (0 = never set,
+// a configuration reset clears it back to LCD_DEFAULT_THEME)
+#define EEPROM_THEME_ADDR (EEPROM_SIZE - 1)
+// byte before it: LCD brightness in % (0 = never set -> LCD_DEFAULT_BRIGHTNESS)
+#define EEPROM_BRIGHTNESS_ADDR (EEPROM_SIZE - 2)
+#define EEPROM_THEME_TAG 0xA0
+
+/**
+ * Board revision - selected automatically from the chip chosen in the IDE:
+ *   rev 1 - SNES RA Adapter proto v0.1-v0.3: ESP32-C3 Super Mini
+ *   rev 2 - SNES RA Adapter proto v0.4+: Waveshare ESP32-S3-Zero. Same GPIO map
+ *           as the NES RA Adapter v2.0 screen board, so one TFT_eSPI User_Setup
+ *           (misc/TFT_eSPI/User_Setup.h) serves both adapters.
+ * Pin maps: hardware/docs/netlist-v0.3.md (rev 1) and netlist-v0.4.md (rev 2).
+ */
+#if CONFIG_IDF_TARGET_ESP32S3
+  #define SNES_BOARD_REV 2
+#else
+  #define SNES_BOARD_REV 1
+#endif
+
+/**
+ * UART to the Pico. Rev 1 uses the C3's default UART0 pins (GPIO 20 RX / 21 TX);
+ * rev 2 routes UART0 through the GPIO matrix (GPIO 43/44 stay free for the boot log).
+ */
+#if SNES_BOARD_REV == 2
+  #define PICO_UART_TX_PIN 5 // -> Pico GP47 (RX)
+  #define PICO_UART_RX_PIN 4 // <- Pico GP46 (TX)
+#endif
 
 /**
  * Bus isolation on SNES is handled entirely by the Pico (via BUFFER_OE_N on
@@ -151,13 +187,22 @@
 /**
  * defines for the LCD
  */
-#define LCD_BRIGHTNESS_PIN 7
+#define LCD_BRIGHTNESS_PIN 7 // same GPIO on both revs
+// backlight in %, the same on every screen; set in the web portal's debug view
+#define LCD_DEFAULT_BRIGHTNESS 80
+#define LCD_MIN_BRIGHTNESS 10
+uint8_t lcd_brightness = LCD_DEFAULT_BRIGHTNESS;
 
 /**
  * defines for status led
  */
-#define LED_STATUS_RED_PIN 6
-#define LED_STATUS_GREEN_PIN 5
+#if SNES_BOARD_REV == 2
+  #define LED_STATUS_RED_PIN 1
+  #define LED_STATUS_GREEN_PIN 13
+#else
+  #define LED_STATUS_RED_PIN 6
+  #define LED_STATUS_GREEN_PIN 5
+#endif
 
 /**
  * defines for the buzzer
@@ -185,7 +230,11 @@
 #define NOTE_AS4 466
 
 
-#define SOUND_PIN 10
+#if SNES_BOARD_REV == 2
+  #define SOUND_PIN 12
+#else
+  #define SOUND_PIN 10
+#endif
 
 /**
  * defines for the reset button
@@ -195,7 +244,11 @@
 #define RESET_PRESSED_TIME 5000L
 
 // pin to the reset button
-#define RESET_PIN 8
+#if SNES_BOARD_REV == 2
+  #define RESET_PIN 2
+#else
+  #define RESET_PIN 8
+#endif
 
 // types for http request
 typedef enum HttpRequestMethod
@@ -408,7 +461,9 @@ const LcdTheme THEME_4 = THEME_TERMINAL;
 
 const LcdTheme* const LCD_THEMES[] = { &THEME_CLASSIC, &THEME_2, &THEME_3, &THEME_4};
 const uint8_t LCD_THEME_COUNT = sizeof(LCD_THEMES) / sizeof(LCD_THEMES[0]);
-uint8_t currentThemeIndex = 3; // index into LCD_THEMES of the active theme
+// theme used until one is picked in the web portal (then it comes from the EEPROM)
+#define LCD_DEFAULT_THEME 3
+uint8_t currentThemeIndex = LCD_DEFAULT_THEME; // index into LCD_THEMES of the active theme
 
 inline const LcdTheme& activeTheme() {
   return *LCD_THEMES[currentThemeIndex];
@@ -425,20 +480,11 @@ const char html_p2[] PROGMEM = "<p>&#8226; RetroAchievements user name: </p>\0";
 const char html_p3[] PROGMEM = "<p>&#8226; RetroAchievements user password: </p>\0";
 const char html_s[] PROGMEM = "<script>gE(\"s\").required=!0;l=cE(\"div\");l.innerHTML=\"SNES RetroAchievements Adapter\",l.id=\"l\";m=d.body.childNodes[0];iB(m,l,m.childNodes[0]);p=cE(\"p\");p.id=\"i\",p.innerHTML=\"Choose the network you want to connect with:\",iB(m,p,m.childNodes[1]),a=d.createTextNode(\" show \"+e),sp=(s=d.getElementById(\"up\").nextSibling).parentNode,(c1=d.createElement(\"input\")).type=\"checkbox\",c1.onclick=cc,c1.w=\"up\",iB(sp,c1,s),iB(sp,a,s);</script>\0";
 
-// ws variables
-#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-AsyncWebServer* server = nullptr;
-AsyncWebSocket* ws = nullptr;
-uint32_t last_ws_cleanup = millis();
-AsyncWebSocketClient *ws_client = NULL;
-bool websocket_initialized = false;
-#endif
-
 // -----------------------------------------------------------------------------
 // Seletor de jogo do modo sniff do Pico (pagina /game, para trocar do celular)
 // -----------------------------------------------------------------------------
-// Independente do webapp experimental: com ENABLE_INTERNAL_WEB_APP_SUPPORT a
-// rota entra no server principal (em init_websocket); sem ele, sobe um
+// Independente do portal: com ENABLE_INTERNAL_WEB_APP_SUPPORT a
+// rota entra no server do portal (web_portal.h); sem ele, sobe um
 // AsyncWebServer minimo so com /game assim que o WiFi conectar.
 // Lista de jogos DUPLICADA da tabela sniff_games[] do
 // snes-pico-firmware/src/main.c -- manter as duas em sincronia.
@@ -525,7 +571,11 @@ char serial_buffer[SERIAL_BUFFER_SIZE];
 size_t serial_buffer_len = 0;
 
 // Flexible buffer for large HTTP responses 
-#define LARGE_BUFFER_SIZE 64000 // 64 KB 
+// 48 KB: with the PNG decoder allocated at boot (~48 KB), a 64 KB buffer left no
+// room on the ESP32-C3 for the TLS handshake with the lambda (AWS RSA chain + two
+// fixed 16 KB mbedTLS record buffers): "HTTP code: -1" on every patch request.
+// 48 KB measured on the C3: ~89 KB free before the patch request, handshake ok.
+#define LARGE_BUFFER_SIZE 48000 // 48 KB
 #define SMALL_BUFFER_SIZE 10240 // 10 KB
 CharBufferStream response;
 // HTTP client global to reuse SSL buffers (avoids fragmentation)
@@ -544,6 +594,9 @@ bool go_back_to_title_screen = false;
 bool already_showed_title_screen = false;
 long go_back_to_title_screen_timestamp;
 unsigned long last_wifi_status_update = 0;
+
+// LAN web portal (uses the globals above)
+#include "web_portal.h"
 
 /**
  * functions related to LED status and control
@@ -981,6 +1034,37 @@ void remove_achievements_with_long_MemAddr_buffer(CharBufferStream &buf, uint32_
   }
 }
 
+/**
+ * Debug print that hides credentials: the values of t= and p= query/form
+ * parameters and of TOKEN_AND_USER= are replaced by "***".
+ */
+void serial_print_masked(const char* s, size_t len) {
+  size_t i = 0;
+  while (i < len) {
+    bool at_param_start = (i == 0 || s[i - 1] == '&' || s[i - 1] == '?' || s[i - 1] == ';' || s[i - 1] == ':');
+    size_t key_len = 0;
+    if (at_param_start && i + 1 < len && (s[i] == 't' || s[i] == 'p') && s[i + 1] == '=') {
+      key_len = 2;
+    } else if (len - i >= 15 && strncmp(s + i, "TOKEN_AND_USER=", 15) == 0) {
+      key_len = 15;
+    }
+    if (key_len > 0) {
+      Serial.write((const uint8_t*)(s + i), key_len);
+      Serial.print(F("***"));
+      i += key_len;
+      while (i < len && s[i] != '&' && s[i] != ',' && s[i] != ';' && s[i] != '\r' && s[i] != '\n' && s[i] != ' ') i++;
+      continue;
+    }
+    Serial.write(s[i]);
+    i++;
+  }
+}
+
+void serial_println_masked(const char* s) {
+  serial_print_masked(s, strlen(s));
+  Serial.println();
+}
+
 
 void print_memory_stats(const char* label = "") {
   Serial.println(F("=== MEMORY STATS ==="));
@@ -1047,8 +1131,71 @@ void initLCD () {
   #ifdef FLIP_SCREEN
     tft.setRotation(2);
   #endif
+  draw_lcd_frame();
+}
 
-  //  draw the title screen
+// last text printed on each of the 5 status lines of the content box, so a theme
+// change can redraw the boot / error screens
+struct LcdLine { char text[40]; int8_t status; int8_t delta; };
+LcdLine lcd_lines[5];
+
+void lcd_remember_line(const char* text, int line, int line_status, int delta)
+{
+  if (line < 0 || line >= 5) return;
+  strlcpy(lcd_lines[line].text, text ? text : "", sizeof(lcd_lines[line].text));
+  lcd_lines[line].status = line_status;
+  lcd_lines[line].delta = delta;
+}
+
+void lcd_replay_lines()
+{
+  LcdLine copy[5];
+  memcpy(copy, lcd_lines, sizeof(copy));
+  for (int i = 0; i < 5; i++) {
+    print_line(copy[i].text, i, copy[i].status, copy[i].delta, activeTheme().boxFill);
+  }
+}
+
+// redraw the whole screen with the (new) active theme
+void lcd_redraw_for_theme()
+{
+  setCpuFrequencyMhz(160);
+  draw_lcd_frame();
+  if (already_showed_title_screen) {
+    go_back_to_title_screen = false; // an achievement on screen gives way to the title
+    show_title_screen();
+  } else {
+    lcd_replay_lines();
+    setCpuFrequencyMhz(80);
+  }
+}
+
+// theme picked in the web portal, persisted in the last EEPROM byte
+void load_theme_from_eeprom()
+{
+  uint8_t v = EEPROM.read(EEPROM_THEME_ADDR);
+  if ((v & 0xF0) == EEPROM_THEME_TAG && (v & 0x0F) < LCD_THEME_COUNT) {
+    currentThemeIndex = v & 0x0F;
+  }
+  Serial.print(F("LCD theme: "));
+  Serial.println(activeTheme().name);
+}
+
+void save_theme_to_eeprom(uint8_t idx)
+{
+  // setup() releases the EEPROM buffer (EEPROM.end) once it is done with it
+  bool opened_here = false;
+  if (EEPROM.length() == 0) {
+    if (!EEPROM.begin(EEPROM_SIZE)) return;
+    opened_here = true;
+  }
+  EEPROM.write(EEPROM_THEME_ADDR, EEPROM_THEME_TAG | (idx & 0x0F));
+  EEPROM.commit();
+  if (opened_here) EEPROM.end();
+}
+
+// background, header, content box and footer of the active theme
+void draw_lcd_frame () {
   const LcdTheme& theme = activeTheme();
   tft.fillScreen(theme.background);
   tft.setTextColor(theme.headerText, theme.background, true);
@@ -1293,6 +1440,7 @@ void print_line(const char* text, int line, int line_status, int delta) {
 void print_line(const char* text, int line, int line_status, int delta, int color)
 {
   #ifdef ENABLE_LCD
+  lcd_remember_line(text, line, line_status, delta);
   const LcdTheme& theme = activeTheme();
   tft.setTextSize(1);
   tft.setTextColor(theme.contentText, color, true);
@@ -1381,7 +1529,7 @@ void show_title_screen()
 {
   setSemaphore(LED_ON, LED_GREEN);
 #ifdef ENABLE_LCD  
-  analogWrite(LCD_BRIGHTNESS_PIN, 150); // set the brightness of the TFT screen
+  apply_lcd_brightness();
   setCpuFrequencyMhz(160);
   const LcdTheme& theme = activeTheme();
   tft.setTextColor(theme.headerText, theme.background, true);
@@ -1431,14 +1579,9 @@ void show_title_screen()
 void show_achievement(achievements_t achievement)
 {
   setSemaphore(LED_BLINK_FAST, LED_GREEN);
-  
-#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-  char aux[256];
-  sprintf(aux, "A=%s;%s;%s", "0", achievement.title.c_str(), achievement.url.c_str());
-  send_ws_data(aux);
-#endif
-#ifdef ENABLE_LCD  
-  analogWrite(LCD_BRIGHTNESS_PIN, 200); // set the brightness of the TFT screen
+  // (the web portal got this unlock as soon as the Pico reported it)
+#ifdef ENABLE_LCD
+  apply_lcd_brightness();
   // if achievement title is longer than 26 chars, add ... at the end
   if (achievement.title.length() > 26)
   {
@@ -1612,6 +1755,35 @@ size_t read_ra_pass_from_eeprom(char* buffer, size_t buffer_size)
   return len;
 }
 
+void apply_lcd_brightness()
+{
+  analogWrite(LCD_BRIGHTNESS_PIN, (uint16_t)lcd_brightness * 255 / 100);
+}
+
+// LCD brightness picked in the web portal (debug view)
+void load_brightness_from_eeprom()
+{
+  uint8_t v = EEPROM.read(EEPROM_BRIGHTNESS_ADDR);
+  lcd_brightness = (v >= LCD_MIN_BRIGHTNESS && v <= 100) ? v : LCD_DEFAULT_BRIGHTNESS;
+  apply_lcd_brightness();
+  Serial.print(F("LCD brightness: "));
+  Serial.print(lcd_brightness);
+  Serial.println(F("%"));
+}
+
+void save_brightness_to_eeprom(uint8_t pct)
+{
+  // setup() releases the EEPROM buffer (EEPROM.end) once it is done with it
+  bool opened_here = false;
+  if (EEPROM.length() == 0) {
+    if (!EEPROM.begin(EEPROM_SIZE)) return;
+    opened_here = true;
+  }
+  EEPROM.write(EEPROM_BRIGHTNESS_ADDR, pct);
+  EEPROM.commit();
+  if (opened_here) EEPROM.end();
+}
+
 /**
  * functions related to the wifi manager
  */
@@ -1663,7 +1835,7 @@ String try_login_RA(String ra_user, String ra_pass)
   String ra_token = extractTokenFromBuffer(response);
   ra_token.trim();
   
-  Serial.print(F("RA Token: ")); Serial.println(ra_token);
+  Serial.print(F("RA Token: ")); Serial.println(ra_token.length() > 0 ? F("***") : F("(vazio)"));
   
   // print_memory_stats("AFTER TOKEN EXTRACT");
   
@@ -1764,87 +1936,118 @@ int try_download_file(String url, String file_name)
 }
 
 // Fetch a file from the URL given and save it in LittleFS
-// Return 1 if a web fetch was needed or 0 if file already exists
+// Returns 0 if the file is in LittleFS (cached or just downloaded), -1 on failure.
+// The download goes to <file>.part and is only renamed when complete, so a
+// connection dropped mid-way never leaves a truncated image that would be
+// "found" (and drawn broken) forever.
 int download_file_to_littleFS(String url, String file_name)
 {
-  int ret = 0;
-  // If it exists then no need to fetch it
-  if (LittleFS.exists(file_name) == true)
+  // If it exists then no need to fetch it (an empty file is a failed download)
+  if (LittleFS.exists(file_name))
   {
-    Serial.print("Found " + file_name + " in LittleFS\n"); // debug
-    return ret;
+    fs::File cached = LittleFS.open(file_name, "r");
+    size_t cached_size = cached ? cached.size() : 0;
+    if (cached) cached.close();
+    if (cached_size > 0)
+    {
+      Serial.println("Found " + file_name + " in LittleFS"); // debug
+      return 0;
+    }
+    LittleFS.remove(file_name);
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return -1;
   }
 
   // before use LittleFS, check if we have enough space and delete files if necessary
   check_free_space_littleFS();
 
-  Serial.print("Downloading " + file_name + " from " + url + "\n"); // debug
+  Serial.println("Downloading " + file_name + " from " + url); // debug
 
-  // Check WiFi connection
-  if ((WiFi.status() == WL_CONNECTED))
+  // This download opens its own TLS session (media.retroachievements.org).
+  // Close the one the RA requests left in the global client (~35 KB: two
+  // fixed 16 KB mbedTLS buffers), or the handshake may not fit next to the
+  // PNG decoder + web portal: the image then silently fails after seconds of
+  // retries (seen on achievement unlocks).
+  globalHttpClient.end();
+  globalSecureClient.stop();
+
+  int ret = -1;
+  String part_name = file_name + ".part";
+  NetworkClientSecure client;
+  HTTPClient http;
+  client.setInsecure();
+  http.begin(client, url);
+
+  // Start connection and send HTTP header
+  int http_code = http.GET();
+  if (http_code == HTTP_CODE_OK)
   {
-    NetworkClientSecure client;
-    HTTPClient http;
-    client.setInsecure();
-    http.begin(client, url);
-
-    // Start connection and send HTTP header
-    int http_code = http.GET();
-    if (http_code == 200)
+    fs::File f = LittleFS.open(part_name, "w");
+    if (!f)
     {
-      fs::File f = LittleFS.open(file_name, "w+");
-      if (!f)
+      Serial.println(F("file open failed")); // debug
+      http.end();
+      return -1;
+    }
+
+    // Get length of document (is -1 when Server sends no Content-Length header)
+    int total = http.getSize();
+    int len = total;
+    size_t written = 0;
+
+    // Create buffer for read
+    uint8_t buff[128] = {0};
+
+    // Get tcp stream
+    WiFiClient *stream = http.getStreamPtr();
+
+    // Read all data from server
+    while (http.connected() && (len > 0 || len == -1))
+    {
+      // Get available data size
+      size_t size = stream->available();
+
+      if (size)
       {
-        Serial.print(F("file open failed\n")); // debug
-        return -1;
-      }
+        // Read up to 128 bytes
+        int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
 
-      // File found at server
-      if (http_code == HTTP_CODE_OK)
-      {
+        // Write it to file
+        written += f.write(buff, c);
 
-        // Get length of document (is -1 when Server sends no Content-Length header)
-        int total = http.getSize();
-        int len = total;
-
-        // Create buffer for read
-        uint8_t buff[128] = {0};
-
-        // Get tcp stream
-        WiFiClient *stream = http.getStreamPtr();
-
-        // Read all data from server
-        while (http.connected() && (len > 0 || len == -1))
+        // Calculate remaining bytes
+        if (len > 0)
         {
-          // Get available data size
-          size_t size = stream->available();
-
-          if (size)
-          {
-            // Read up to 128 bytes
-            int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
-
-            // Write it to file
-            f.write(buff, c);
-
-            // Calculate remaining bytes
-            if (len > 0)
-            {
-              len -= c;
-            }
-          }
-          yield();
+          len -= c;
         }
       }
-      f.close();
+      yield();
+    }
+    f.close();
+
+    bool complete = (total > 0) ? (len <= 0 && written == (size_t)total) : (written > 0);
+    if (complete && LittleFS.rename(part_name, file_name))
+    {
+      ret = 0;
     }
     else
     {
-      Serial.print(F("download failed, error: ")); Serial.println(http.errorToString(http_code)); // debug
-      ret = -1;
+      Serial.print(F("download incomplete: ")); Serial.print(written);
+      Serial.print(F(" of ")); Serial.println(total);
+      LittleFS.remove(part_name);
+      web_on_request_failed("img(partial)", (int)written);
     }
-    http.end();
   }
+  else
+  {
+    Serial.print(F("download failed, error: ")); Serial.println(http.errorToString(http_code)); // debug
+    print_memory_stats("IMAGE DOWNLOAD FAILED");
+    web_on_request_failed("img", http_code);
+  }
+  http.end();
   return ret;
 }
 
@@ -1864,6 +2067,7 @@ void onWiFiConnect(WiFiEvent_t event, WiFiEventInfo_t info)
 void onWiFiDisconnect(WiFiEvent_t event, WiFiEventInfo_t info)
 {
   Serial.println(F("WiFi disconnected."));
+  web_on_wifi_drop(info.wifi_sta_disconnected.reason);
   WiFi.reconnect();
 }
 
@@ -1944,133 +2148,11 @@ void config_mDNS()
   Serial.println(mdnsName + ".local");
 
   MDNS.addService("nraa", "tcp", 80);
+  MDNS.addService("http", "tcp", 80);
   Serial.println(F("service mDNS announced"));
 }
 
-// handle websocket events
-void on_websocket_event(AsyncWebSocket *server, AsyncWebSocketClient *client,
-                        AwsEventType type, void *arg, uint8_t *data, size_t len)
-{
-
-  if (type == WS_EVT_CONNECT)
-  {
-    // just one simultaneous connection for the time being
-    Serial.println(F("new ws connection"));
-    if (ws_client != NULL)
-    {
-      Serial.println(F("closing last connection"));
-      ws_client->close();
-    }
-    ws_client = client;
-    client->setCloseClientOnQueueFull(false);
-    client->ping();
-  }
-  else if (type == WS_EVT_PONG)
-  {
-    Serial.println(F("ws pong"));
-    if (game_id != "0") // we have a game running
-    {
-      // send the game name and image to the client
-      char aux[512];
-      sprintf(aux, "G=%s;%s;%s;%s", game_session.c_str(), game_id.c_str(), game_name.c_str(), game_image.c_str());
-      client->text(aux);
-    }
-  }
-  else if (type == WS_EVT_DISCONNECT)
-  {
-    Serial.println(F("ws disconnect"));
-    if (ws_client != NULL)
-    {
-      ws_client->close();
-      ws_client = NULL;
-    }
-  }
-  else if (type == WS_EVT_DATA)
-  {
-    data[len] = 0; 
-    if (strcmp((char *)data, "ping") == 0)
-    {
-      Serial.println(F("ws ping"));
-      client->text("pong");
-    }
-  }
-}
-
-// send websocket data
-void send_ws_data(String data)
-{
-  if (ws_client != NULL)
-  {
-    ws_client->text(data);
-  }
-}
-
-// initialize the websocket server (dynamically allocated to save memory until needed)
-void init_websocket()
-{
-  if (websocket_initialized) {
-    Serial.println(F("WebSocket already initialized"));
-    return;
-  }
-  
-  // print_memory_stats("BEFORE WEBSOCKET INIT");
-  
-  // Instantiate dynamically only now (after patch)
-  if (ws == nullptr) {
-    ws = new (std::nothrow) AsyncWebSocket("/ws");
-    if (ws == nullptr) {
-      Serial.println(F("Failed to allocate AsyncWebSocket"));
-      return;
-    }
-  }
-  
-  if (server == nullptr) {
-    server = new (std::nothrow) AsyncWebServer(80);
-    if (server == nullptr) {
-      Serial.println(F("Failed to allocate AsyncWebServer"));
-      delete ws;
-      ws = nullptr;
-      return;
-    }
-  }
-  
-  // ws begin
-  ws->onEvent(on_websocket_event);
-  
-  // Serve static files (HTML, CSS, JS)
-  server->serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
-
-  server->serveStatic("/sw.js", LittleFS, "/sw.js")
-      .setCacheControl("no-cache, no-store, must-revalidate");
-  server->serveStatic("/index.html", LittleFS, "/index.html")
-      .setCacheControl("no-cache, no-store, must-revalidate");
-
-  server->serveStatic("/snd.mp3", LittleFS, "/snd.mp3")
-      .setCacheControl("max-age=86400");
-
-  // Seletor de jogo (modo sniff): rota /game no server principal
-  game_selector_route(server);
-
-  server->addHandler(ws);
-  server->begin();
-  
-#ifdef ENABLE_LCD
-  // Initialize PNG decoder now (after patch, when memory is available)
-  if (png == nullptr) {
-    png = new (std::nothrow) PNG();
-    if (png == nullptr) {
-      Serial.println(F("Failed to allocate PNG decoder"));
-    }
-  }
-#endif
-  
-  // Configure mDNS here, along with the websocket (after patch)
-  config_mDNS();
-  
-  websocket_initialized = true;
-  Serial.println(F("WebSocket server initialized"));
-  // print_memory_stats("AFTER WEBSOCKET INIT");
-}
+// (WebSocket / HTTP routes of the portal live in web_portal.h)
 #endif
 
 /**
@@ -2139,8 +2221,8 @@ int perform_http_request_buffer(
     globalSecureClient.setTimeout(timeoutMs / 1000 + 30); // +30s extra for chunked encoding
     globalHttpClient.setTimeout(timeoutMs);
     
-    Serial.print(F("Connecting to: ")); Serial.println(url);
-    Serial.print(F("data: ")); Serial.println(payload);
+    Serial.print(F("Connecting to: ")); serial_println_masked(url);
+    Serial.print(F("data: ")); serial_println_masked(payload);
     
     if (!globalHttpClient.begin(globalSecureClient, url)) {
       Serial.println(F("HTTPClient begin failed"));
@@ -2474,12 +2556,13 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
   
   // Use fixed buffer for data (avoids fragmentation)
   char data[512];
-  if (data_len >= sizeof(data) - 16) data_len = sizeof(data) - 17; // leave space for "&f=3"
+  if (data_len >= sizeof(data) - 32) data_len = sizeof(data) - 33; // leave space for "&f=3&max=...&full=1"
   memcpy(data, data_ptr, data_len);
   data[data_len] = '\0';
   
   bool is_patch_request = (strncmp(data, "r=patch", 7) == 0);
-  
+  web_on_request(data); // portal: rich presence (ping)
+
   // Final URL (can be lambda) - use direct pointer
   const char* final_url = url;
   if (is_patch_request && ENABLE_SHRINK_LAMBDA == 1) {
@@ -2490,18 +2573,37 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
   if (is_patch_request) {
     // print_memory_stats("BEFORE PATCH REQUEST");
     
-    // Trim trailing spaces; add &f=3 + orcamento p/ o lambda (Fase A:
-    // o Pico 2 aceita 90KB; NES antigos nao mandam &max e ficam nos 32KB)
+    // Trim trailing spaces; add &f=3 + orcamento p/ o lambda. O orcamento e'
+    // o que cabe no buffer de resposta deste ESP32 (o Pico 2 aceita 90KB, mas
+    // o buffer aqui e' de ~48KB: pedir 90KB fazia patches maiores que o buffer
+    // estourarem o buffer). A folga cobre a diferenca entre o tamanho que o
+    // lambda mede (caracteres) e os bytes UTF-8. &full=1: o lambda mantem
+    // descricao e raridade (para o portal web, via Pico) quando couberem --
+    // nunca a custo de achievements.
     while (data_len > 0 && data[data_len - 1] == ' ') data_len--;
-    strcpy(data + data_len, "&f=3&max=90000");
-    data_len += 14;
-    
-    
+    size_t budget = response.capacity() > 4096 ? response.capacity() - 4096 : 8000;
+    if (budget > SERIAL_MAX_PICO_BUFFER - 2048) budget = SERIAL_MAX_PICO_BUFFER - 2048;
+    data_len += snprintf(data + data_len, sizeof(data) - data_len, "&f=3&max=%u%s",
+                         (unsigned)budget,
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+                         "&full=1"
+#else
+                         ""
+#endif
+                         );
   }
   
   // Prepare memory for large download
   if (is_patch_request) {
     Serial.println(F("Preparing memory for large download..."));
+    // The TLS session left in the global client by the previous requests
+    // (login / gameid on retroachievements.org, kept alive) owns ~35 KB: two
+    // fixed 16 KB mbedTLS record buffers + context, only freed by stop(). The
+    // patch goes to another host (lambda), so it can't be reused anyway: close
+    // it now, or the new handshake doesn't fit next to the patch buffer
+    // (seen as "HTTP code: -1" with ~14 KB largest free block).
+    globalHttpClient.end();
+    globalSecureClient.stop();
     // Disable WiFi power save during large download (more stable)
     esp_wifi_set_ps(WIFI_PS_NONE);
     // Small delay to allow the system to free resources
@@ -2521,6 +2623,7 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
   if (ret < 0) {
     Serial.print(F("ERROR ON RESPONSE: "));
     Serial.println(http_request_result_to_cstr(ret));
+    web_on_request_failed(data, ret);
     if (ret == HTTP_ERR_REPONSE_TOO_BIG) {
       state = STATE_ERROR_RESPONSE_TOO_BIG;
     } else {
@@ -2532,17 +2635,23 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
       Serial.print(F("PATCH LENGTH: "));
       Serial.println(response.length());
       
-      clean_json_field_str_value_buffer(response, "Description");
       remove_json_field_buffer(response, "Warning");
       remove_json_field_buffer(response, "BadgeLockedURL");
       remove_json_field_buffer(response, "BadgeURL");
       remove_json_field_buffer(response, "ImageIconURL");
-      remove_json_field_buffer(response, "Rarity");
-      remove_json_field_buffer(response, "RarityHardcore");
       remove_json_field_buffer(response, "Author");
       remove_json_field_buffer(response, "RichPresencePatch");
       clean_json_field_array_value_buffer(response, "Leaderboards");
       remove_achievements_with_flags_5_buffer(response);
+
+      // Descricao e raridade so' servem ao portal web (o Pico as repassa):
+      // ficam se couberem no Pico, saem antes de qualquer achievement.
+      if (response.length() > SERIAL_MAX_PICO_BUFFER) {
+        Serial.println(F("removing descriptions and rarity"));
+        clean_json_field_str_value_buffer(response, "Description");
+        remove_json_field_buffer(response, "Rarity");
+        remove_json_field_buffer(response, "RarityHardcore");
+      }
       
       if (response.length() > SERIAL_MAX_PICO_BUFFER) {
         Serial.println(F("removing achievements with MemAddr > 4KB"));
@@ -2565,7 +2674,14 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
         remove_achievements_with_long_MemAddr_buffer(response, 512);
       }
       
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+      g_log_mute = true;  // up to 90 KB: would flush the portal's whole log ring
+#endif
       Serial.println(response.c_str());
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+      g_log_mute = false;
+      Serial.println(F("(patch JSON printed on USB only)"));
+#endif
       Serial.print(F("NEW PATCH LENGTH: "));
       Serial.println(response.length());
     } else if (strncmp(data, "r=login", 7) == 0) {
@@ -2768,7 +2884,10 @@ void handle_achievement_command(const char* cmd, size_t cmd_len) {
   
   // Increment unlocked counter
   unlocked_achievements++;
-  
+
+  // portal: toast right away (the LCD may still be busy with a previous one)
+  web_on_unlock(achievement.id, title_str, url_str);
+
   if (fifo_enqueue(&achievements_fifo, achievement) == false) {
     Serial.print(F("FIFO_FULL\r\n"));
   } else {
@@ -2836,7 +2955,8 @@ void handle_game_info_command(const char* cmd, size_t cmd_len) {
   memcpy(url_str, url_ptr, url_len);
   url_str[url_len] = '\0';
   game_image = String(url_str);
-  
+  web_on_game_info(id_str, name_str, url_str);
+
   if (game_id == "0") {
     state = STATE_ERROR_CARTRIDGE_NOT_FOUND;
     return;
@@ -2913,6 +3033,7 @@ void handle_ach_summary_command(const char* cmd, size_t cmd_len) {
   Serial.print(unlocked_achievements);
   Serial.print(F("/"));
   Serial.println(total_achievements);
+  web_on_summary(unlocked_achievements, total_achievements);
 }
 
 /**
@@ -2922,17 +3043,18 @@ void handle_ach_summary_command(const char* cmd, size_t cmd_len) {
 void handle_console_reset_command() {
   uint8_t random = (uint8_t)esp_random();
   game_session = String(random);
-  
-#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-  init_websocket();
-  char aux[512];
-  send_ws_data("RESET");
-  sprintf(aux, "G=%s;%s;%s;%s", game_session.c_str(), game_id.c_str(), game_name.c_str(), game_image.c_str());
-  if (ws_client) {
-    ws_client->text(aux);
+
+#ifdef ENABLE_LCD
+  // fallback: allocate the PNG decoder now (post-patch) if the boot-time one failed
+  if (png == nullptr) {
+    png = new (std::nothrow) PNG();
+    if (png == nullptr) {
+      Serial.println(F("Failed to allocate PNG decoder"));
+    }
   }
 #endif
-  
+  web_on_console_reset();
+
   show_title_screen();
   state = STATE_IDLE;
 }
@@ -2977,7 +3099,9 @@ bool syncWithPico(int maxRetries = 3) {
 // arduino-esp32 entry point
 void setup()
 {
- 
+  web_diag_early_init(); // reset reason + boot counter for the portal's debug view
+  log_tee_alloc();       // portal debug log, only on boards with PSRAM (ESP32-S3)
+
   setCpuFrequencyMhz(80);
   // disable i2c
   Wire.end();
@@ -2988,7 +3112,7 @@ void setup()
 
   //config lcd brightness
   pinMode(LCD_BRIGHTNESS_PIN, OUTPUT);
-  analogWrite(LCD_BRIGHTNESS_PIN, 192); // set the brightness of the TFT screen
+  apply_lcd_brightness(); // default until the saved value is read from the EEPROM
 
   // config the led status pin
   pinMode(LED_STATUS_GREEN_PIN, OUTPUT);
@@ -2998,7 +3122,15 @@ void setup()
 
   Serial.begin(9600);    // initialize the serial port
   Serial0.setTimeout(2); // 2ms timeout for Serial0
+  // room for a whole chunk of the portal's achievement list (2 lines of up to
+  // ~420 bytes + ALN=) even while the loop is busy (LCD, sound, HTTP);
+  // must be set before begin()
+  Serial0.setRxBufferSize(1024);
+#if SNES_BOARD_REV == 2
+  Serial0.begin(115200, SERIAL_8N1, PICO_UART_RX_PIN, PICO_UART_TX_PIN);
+#else
   Serial0.begin(115200);
+#endif
   // consume any garbage in the serial buffer before communicating with the pico
   if (Serial0.available() > 0)
   {
@@ -3031,8 +3163,8 @@ void setup()
     Serial.print(LARGE_BUFFER_SIZE); 
     Serial.println(F(" bytes"));
   } else {
-    // Tentar tamanhos menores se 90KB falhar
-    size_t sizes[] = {85000, 80000, 75000, 70000, 65000};
+    // Tentar tamanhos menores se o tamanho padrao falhar
+    size_t sizes[] = {44000, 40000, 36000, 32000, 28000};
     bool allocated = false;
     for (int i = 0; i < 5 && !allocated; i++) {
       if (response.reserve(sizes[i])) {
@@ -3063,6 +3195,10 @@ void setup()
 
   // initialize stuff
   init_EEPROM(false); // initialize the EEPROM
+#ifdef ENABLE_LCD
+  load_theme_from_eeprom(); // before initLCD draws anything
+#endif
+  load_brightness_from_eeprom();
 
   fifo_init(&achievements_fifo); // initialize the achievement fifo
 
@@ -3170,7 +3306,7 @@ void setup()
         String temp_ra_user = custom_param_1.getValue();
         String temp_ra_pass = custom_param_2.getValue();
         ra_user_token = try_login_RA(temp_ra_user, temp_ra_pass);
-        Serial.print(ra_user_token);
+        Serial.println(ra_user_token.length() > 0 ? F("token: ***") : F("token: (vazio)"));
         if (ra_user_token.compareTo("") != 0)
         {
           setSemaphore(LED_BLINK_MEDIUM, LED_GREEN);
@@ -3220,7 +3356,7 @@ void setup()
     char ra_pass[128];
     read_ra_user_from_eeprom(ra_user, sizeof(ra_user));
     read_ra_pass_from_eeprom(ra_pass, sizeof(ra_pass));
-    
+
     print_line("Logging in RA...", 1, 1);
     ra_user_token = try_login_RA(String(ra_user), String(ra_pass));
     if (ra_user_token.compareTo("") != 0)
@@ -3259,7 +3395,7 @@ void setup()
   sprintf(token_and_user, "TOKEN_AND_USER=%s,%s\r\n", ra_user_token.c_str(), ra_user_for_pico);
 
   delay(250);                   // make sure pico restarted
-  Serial.print(token_and_user); // debug
+  serial_print_masked(token_and_user, strlen(token_and_user)); // debug
   Serial0.print(token_and_user);  
   state = STATE_IDENTIFY_CARTRIDGE;
 
@@ -3289,18 +3425,9 @@ void loop()
     ESP.restart();
   }
 
-#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-  if (websocket_initialized && ws != nullptr) {
-    uint32_t delta_ws_cleanup = millis() - last_ws_cleanup;
-    last_ws_cleanup = millis();
-    if (delta_ws_cleanup > 1000)
-    {
-      ws->cleanupClients();
-    }
-  }
-
-  // #TODO last ping was too long ago, closes the connection
-#endif
+  // web portal: start once Wi-Fi is up, WS cleanup, theme/reboot requests,
+  // achievement list download (only while a browser is watching)
+  web_loop();
 
   // Update WiFi status every 10 seconds after title screen was shown
   if (already_showed_title_screen && (millis() - last_wifi_status_update > 10000))
@@ -3327,6 +3454,7 @@ void loop()
     setSemaphore(LED_BLINK_FAST, LED_RED);
     const char* errorMsg = getStateErrorMessage(state);
     print_line(errorMsg, 1, 2);
+    web_on_error(errorMsg);
     
     if (state == STATE_ERROR_CONNECTIVITY) {
       print_line("It's not recording achievs", 2, 2);
@@ -3334,6 +3462,14 @@ void loop()
     
     print_line("Turn off the console", 4, 2);
     play_error_sound();
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+    // nothing big is downloaded after an error: give the patch buffer back so
+    // the web portal can come up and show it
+    if (response.capacity() > SMALL_BUFFER_SIZE) {
+      response.release();
+      response.reserve(SMALL_BUFFER_SIZE);
+    }
+#endif
     state = STATE_IDLE; // do nothing - it will not enable the BUS, so the game will not boot
   }
 
@@ -3419,28 +3555,23 @@ void loop()
       else if (starts_with(serial_buffer, cmd_len, "SNES_RESETED")) {
         handle_console_reset_command();
       }
-      else if (starts_with(serial_buffer, cmd_len, "C=")) {
-#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-        // Create temporary String only for websocket
-        char temp[256];
-        size_t temp_len = min(cmd_len, sizeof(temp) - 1);
-        memcpy(temp, serial_buffer, temp_len);
-        temp[temp_len] = '\0';
-        send_ws_data(String(temp));
-#endif
+      else if (starts_with(serial_buffer, cmd_len, "AL")) {
+        // achievement list for the web portal (ALH= / AL= / ALN= / ALE=):
+        // relayed to the browser, nothing is kept here
+        web_on_list_line(serial_buffer, cmd_len);
       }
-      else if (starts_with(serial_buffer, cmd_len, "P=")) {
-#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-        char temp[256];
-        size_t temp_len = min(cmd_len, sizeof(temp) - 1);
-        memcpy(temp, serial_buffer, temp_len);
-        temp[temp_len] = '\0';
-        send_ws_data(String(temp));
-#endif
+      else if (starts_with(serial_buffer, cmd_len, "C=") || starts_with(serial_buffer, cmd_len, "P=")) {
+        // challenge / progress indicators: only the web portal shows them
+        web_on_indicator(serial_buffer, cmd_len);
+      }
+      else if (starts_with(serial_buffer, cmd_len, "PICO_FIRMWARE_VERSION=")) {
+        Serial.write(serial_buffer, cmd_len);
+        Serial.println();
+        web_on_pico_version(serial_buffer + 22, cmd_len - 22);
       }
       else {
         Serial.print(F("UNKNOWN="));
-        Serial.write(serial_buffer, cmd_len);
+        serial_print_masked(serial_buffer, cmd_len);
         Serial.println();
       }
       

@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#000808">
+  <title>SNES RA Dashboard</title>
+  <script>
+    /* paint the last theme before the first fetch (no flash of default colors) */
+    try{
+      const c = JSON.parse(localStorage.getItem('ra-theme') || 'null');
+      if (c && c.length === 9){
+        const v = ['--bg','--hd','--ft','--bd','--fill','--tx','--ok','--warn','--err'];
+        v.forEach((n,k) => document.documentElement.style.setProperty(n, c[k]));
+      }
+    }catch(e){}
+  </script>
+  <style>
+    /* Colors come from the LCD themes of the firmware (GET /api/themes):
+       bg = screen background, hd = header text, ft = footer text,
+       bd = content box border, fill = content box, tx = text in the box,
+       ok / warn / err = status colors. Defaults = "Terminal". */
+    :root { --bg:#000808; --hd:#31f721; --ft:#299a21; --bd:#29d229; --fill:#080808; --tx:#52ca3a;
+      --ok:#00ff00; --warn:#ffff00; --err:#ff0000;
+      --accent:var(--bd); --gold:var(--warn);
+      --line:color-mix(in srgb, var(--bd) 40%, var(--fill));
+      --item:color-mix(in srgb, var(--fill) 90%, var(--tx));
+      --chip:color-mix(in srgb, var(--fill) 80%, var(--tx));
+      --muted:color-mix(in srgb, var(--tx) 62%, var(--fill)); }
+    * { box-sizing:border-box; }
+    html,body { margin:0; min-height:100%; background:var(--bg); color:var(--tx);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    header { display:flex; align-items:center; gap:14px; padding:14px 18px; background:var(--bg);
+      border-bottom:2px solid var(--bd); position:relative; }
+    header h1 { font-size:16px; margin:0; letter-spacing:.5px; color:var(--hd); }
+    .dot { width:10px; height:10px; border-radius:50%; background:var(--err); box-shadow:0 0 8px var(--err); flex:0 0 auto; }
+    .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+    .status { margin-left:auto; font-size:13px; color:var(--hd); opacity:.8; white-space:nowrap; }
+    .tbtn { background:var(--fill); color:var(--tx); border:2px solid var(--bd); border-radius:20px;
+      padding:4px 11px; font-size:13px; cursor:pointer; flex:0 0 auto; }
+    #themes { display:none; position:absolute; right:12px; top:100%; margin-top:6px; z-index:1002;
+      background:var(--fill); border:2px solid var(--bd); border-radius:14px; padding:10px;
+      box-shadow:0 8px 30px #0009; min-width:200px; }
+    #themes.on { display:grid; gap:6px; }
+    #themes .lbl { font-size:11px; color:var(--muted); margin:0 2px 2px; }
+    .th { display:flex; align-items:center; gap:10px; padding:7px 10px; border-radius:10px; cursor:pointer;
+      border:2px solid transparent; font-size:13px; background:var(--item); color:var(--tx); }
+    .th.sel { border-color:var(--accent); font-weight:700; }
+    .sw { display:flex; border-radius:6px; overflow:hidden; border:1px solid #0006; flex:0 0 auto; }
+    .sw i { width:14px; height:22px; display:block; }
+    main { padding:18px; display:grid; gap:16px; grid-template-columns:1fr; max-width:900px; margin:0 auto; }
+    .card { background:var(--fill); border:3px solid var(--bd); border-radius:14px; padding:18px; }
+    .game { display:flex; align-items:center; gap:18px; }
+    .game .title { font-size:22px; font-weight:700; }
+    .game .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+    .gameimg { width:96px; height:96px; border-radius:12px; flex:0 0 auto; object-fit:cover;
+      background:var(--item); border:1px solid var(--line); cursor:pointer; }
+    .barrow { display:flex; align-items:center; gap:10px; margin-top:14px; }
+    .bar { height:10px; background:var(--chip); border-radius:6px; overflow:hidden; flex:1; }
+    .bar > i { display:block; height:100%; width:0; background:var(--gold); transition:width .4s; }
+    .barpct { font-size:14px; font-weight:700; color:var(--gold); min-width:38px; text-align:right; }
+    .stats { display:flex; gap:22px; margin-top:12px; font-size:13px; color:var(--muted); flex-wrap:wrap; }
+    .stats b { color:var(--gold); font-size:16px; display:block; }
+    .soon { color:var(--muted); font-size:13px; text-align:center; padding:20px; }
+    footer { text-align:center; color:var(--ft); font-size:11px; padding:16px; }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    .tab { padding:7px 14px; border-radius:20px; background:var(--item); border:1px solid var(--line);
+      font-size:13px; cursor:pointer; user-select:none; color:var(--tx); text-decoration:none; }
+    .tab.sel { background:var(--accent); color:var(--fill); border-color:var(--accent); font-weight:700; }
+    .tab .n { opacity:.7; font-weight:400; margin-left:5px; }
+    .grid { display:grid; gap:10px; grid-template-columns:1fr; }
+    @media(min-width:560px){ .grid{ grid-template-columns:1fr 1fr; } }
+    .ach { display:flex; gap:12px; align-items:center; background:var(--item); border:1px solid var(--line);
+      border-radius:12px; padding:10px 12px; }
+    .ach.locked { opacity:.62; }
+    .ach.challenge { border-color:var(--gold); box-shadow:0 0 0 1px var(--gold) inset; opacity:1; }
+    .ach.active { border-color:var(--accent); opacity:1; }
+    .ach img { width:52px; height:52px; border-radius:8px; flex:0 0 auto; background:var(--fill); }
+    .ach.locked img { filter:grayscale(1) brightness(.7); }
+    .ach .info { flex:1; min-width:0; }
+    .ach .nm { font-weight:600; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .ach .ds { font-size:12px; color:var(--muted); margin-top:2px; display:-webkit-box; -webkit-line-clamp:2;
+      -webkit-box-orient:vertical; overflow:hidden; }
+    .ach .meta { font-size:11px; color:var(--muted); margin-top:4px; display:flex; gap:8px; align-items:center; }
+    .pill { background:var(--chip); padding:1px 7px; border-radius:10px; }
+    .pill.gold { color:var(--gold); }
+    .pill.prog { color:var(--accent); }
+    .pill.win  { color:var(--ok); }
+    .pill.miss, .pill.off { color:var(--err); }
+    .ach .pbar { height:6px; background:var(--chip); border-radius:4px; overflow:hidden; margin-top:5px; }
+    .ach .pbar > i { display:block; height:100%; background:var(--gold); }
+    .badge-pts { color:var(--gold); font-weight:700; }
+    .setsum { font-size:12px; margin-bottom:12px; display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); }
+    .setsum b { color:var(--gold); }
+    .setsum .beaten { color:var(--ok); font-weight:700; }
+    .mode { display:inline-block; margin-left:8px; padding:1px 6px; border-radius:6px; font-size:11px;
+      font-weight:800; letter-spacing:.4px; vertical-align:4px; border:1px solid var(--line); }
+    .mode.hc { color:var(--err); }
+    .mode.sc { color:var(--muted); }
+    .ralink { display:inline-block; margin-left:8px; padding:1px 6px; border-radius:6px; font-size:11px;
+      font-weight:800; letter-spacing:.4px; line-height:16px; vertical-align:4px; text-decoration:none;
+      color:var(--gold); border:1px solid var(--line); background:var(--item); }
+    .ralink[hidden], .mode[hidden] { display:none; }
+    #rp { font-size:12px; color:var(--accent); margin-top:6px; min-height:14px; overflow-wrap:anywhere; }
+    #toasts { position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+      display:flex; flex-direction:column; gap:10px; align-items:center; z-index:1000; }
+    .toast { display:flex; align-items:center; gap:12px; background:var(--fill); color:var(--tx);
+      border:2px solid var(--gold); border-radius:14px; padding:12px 18px; max-width:88vw;
+      box-shadow:0 8px 30px #000a; animation:pop .4s ease-out, fade .5s ease-in 4.5s forwards; }
+    .toast img { width:46px; height:46px; border-radius:8px; }
+    .toast .tt { font-size:12px; color:var(--gold); font-weight:700; letter-spacing:.4px; }
+    .toast .tn { font-size:15px; font-weight:700; }
+    @keyframes pop { from{ transform:translateY(16px) scale(.9); opacity:0 } to{ transform:none; opacity:1 } }
+    @keyframes fade { to{ opacity:0; transform:translateY(-8px) } }
+
+    /* ---- hidden debug view (tap the game image 10x) ---- */
+    .hint { position:fixed; left:50%; top:18px; transform:translateX(-50%); z-index:1001;
+      background:var(--fill); color:var(--tx); border:2px solid var(--bd); border-radius:20px; padding:8px 16px;
+      font-size:13px; animation:pop .25s ease-out; pointer-events:none; }
+    #dbg { display:none; }
+    #dbg.on { display:block; }
+    #dbg h2 { font-size:13px; margin:0 0 12px; letter-spacing:.6px; color:var(--accent); }
+    #dbg h2.sub { margin-top:18px; }
+    .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; }
+    .kv dt { color:var(--muted); }
+    .kv dd { margin:0; font-family:ui-monospace,Consolas,monospace; overflow-wrap:anywhere; min-width:0; }
+    .kv dd.warn { color:var(--warn); }
+    .kv dd.bad  { color:var(--err); }
+    .dbtns { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 10px; }
+    .dbtns .tab { font-size:12px; }
+    .optmsg { font-size:12px; color:var(--gold); min-height:16px; }
+    .opt { display:flex; align-items:center; gap:12px; font-size:13px; margin:4px 0 2px; }
+    .opt input[type=range] { flex:1; min-width:0; accent-color:var(--accent); }
+    .opt b { color:var(--gold); min-width:44px; text-align:right; }
+    pre.log { margin:0; background:var(--bg); color:var(--tx); border:1px solid var(--line); border-radius:10px;
+      padding:10px; height:50vh; overflow:auto; font-size:11px; line-height:1.4;
+      white-space:pre-wrap; overflow-wrap:anywhere; }
+
+    /* ---- mobile fit: never scroll sideways ---- */
+    html, body { overflow-x:hidden; max-width:100vw; }
+    img { max-width:100%; }
+    .grid > *, .ach, .ach .info, .game > div { min-width:0; }
+    .ach .meta { flex-wrap:wrap; row-gap:3px; }
+    .ach .nm, .game .title { overflow-wrap:anywhere; }
+    header h1 { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+    @media (max-width:400px){
+      header { padding:10px 12px; gap:10px; }
+      header h1 { font-size:13px; }
+      .status { font-size:11px; }
+      main { padding:10px; gap:12px; }
+      .card { padding:12px; border-radius:12px; }
+      .game { gap:12px; }
+      .game .title { font-size:17px; }
+      .gameimg { width:72px; height:72px; }
+      .barpct { font-size:12px; min-width:32px; }
+      .stats { gap:14px; font-size:12px; }
+      .stats b { font-size:14px; }
+      .tab { padding:6px 11px; font-size:12px; }
+      .ach { padding:8px 10px; gap:10px; }
+      .ach img { width:44px; height:44px; }
+      .ach .nm { font-size:13px; }
+      .toast { padding:10px 14px; max-width:94vw; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="dot" id="dot"></div>
+    <h1>SNES RETROACHIEVEMENTS</h1>
+    <div class="status" id="status">connecting…</div>
+    <button class="tbtn" id="tbtn" title="Theme (screen + this page)">🎨</button>
+    <div id="themes"></div>
+  </header>
+  <main>
+    <div class="card game">
+      <img class="gameimg" id="gimg" alt="" onerror="this.removeAttribute('src')">
+      <div style="flex:1;min-width:0">
+        <div class="title"><span id="title">—</span><span class="mode" id="mode" hidden></span><a class="ralink" id="ralink" target="_blank" rel="noopener" title="Open on RetroAchievements" hidden>RA ↗</a></div>
+        <div class="sub" id="sub">waiting for a game…</div>
+        <div id="rp"></div>
+        <div class="barrow"><div class="bar"><i id="barfill"></i></div><span class="barpct" id="barpct">0%</span></div>
+        <div class="stats">
+          <div><b id="s-unlocked">0/0</b>achievements</div>
+          <div><b id="s-points">–</b>points</div>
+          <div><b id="s-beaten">–</b>beaten</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="setsum" id="setsum"></div>
+      <div class="tabs" id="tabs"></div>
+      <div class="grid" id="grid"></div>
+    </div>
+    <div class="card" id="dbg">
+      <h2>DEBUG</h2>
+      <dl class="kv" id="dbg-kv"></dl>
+      <h2 class="sub">ADAPTER</h2>
+      <label class="opt">Screen brightness
+        <input type="range" id="opt-bright" min="10" max="100" step="5" value="80">
+        <b id="opt-bright-v">–</b>
+      </label>
+      <div class="dbtns">
+        <div class="tab" id="dbg-reboot">Reboot adapter</div>
+        <a class="tab" href="/game">Sniff game selector</a>
+      </div>
+      <div class="optmsg" id="opt-msg"></div>
+      <h2 class="sub">LOG</h2>
+      <div class="soon" id="dbg-nolog" style="display:none;text-align:left;padding:0">The serial log is only kept on boards with PSRAM (ESP32-S3, rev 2).</div>
+      <div id="dbg-logbox">
+        <div class="dbtns">
+          <div class="tab sel" id="dbg-live">Live log</div>
+          <div class="tab" id="dbg-boot">Boot log</div>
+          <div class="tab" id="dbg-copy">Copy</div>
+          <div class="tab" id="dbg-save">Download</div>
+        </div>
+        <pre class="log" id="dbg-log"></pre>
+      </div>
+      <div class="dbtns"><div class="tab" id="dbg-off">Turn off debug mode</div></div>
+    </div>
+  </main>
+  <footer>SNES RA Adapter · by Odelot &amp; mi213</footer>
+  <div id="toasts"></div>
+  <audio id="snd" src="/snd.mp3" preload="auto"></audio>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const BADGE = 'https://media.retroachievements.org/Badge/';
+    const TY_MISS = 1, TY_PROG = 2, TY_WIN = 3;
+    /* rc_client buckets (Pico) */
+    const BK_UNSUPPORTED = 3, BK_CHALLENGE = 6;
+
+    let S = {};                 /* last /api/state (game header, kept by the ESP32) */
+    /* The achievement list comes from the Pico (rc_client), relayed line by line
+       by the ESP32 over the WebSocket: ALH= header, AL= one per achievement,
+       ALE= end. Nothing is stored on the ESP32. */
+    let L = null;               /* {gid, hc, dropped, stubbed, items:[...]} */
+    let pend = null;            /* list being received */
+    let listReqAt = 0, listTimeout = false;
+    let filter = 'all';
+    let liveSeq = 0;
+
+    function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+    function setConn(ok){
+      $('dot').classList.toggle('on', ok);
+      $('status').textContent = ok ? 'connected' : 'offline';
+    }
+
+    /* ---- themes (same colors as the adapter screen) ---- */
+    let themes = [], themeCur = -1;
+    const TVARS = ['--bg','--hd','--ft','--bd','--fill','--tx','--ok','--warn','--err'];
+
+    function applyTheme(i){
+      const t = themes[i];
+      if (!t) return;
+      themeCur = i;
+      const st = document.documentElement.style;
+      TVARS.forEach((v,k) => st.setProperty(v, t.c[k]));
+      document.querySelector('meta[name=theme-color]').content = t.c[0];
+      try{ localStorage.setItem('ra-theme', JSON.stringify(t.c)); }catch(e){}
+      renderThemes();
+    }
+
+    function renderThemes(){
+      const box = $('themes');
+      box.innerHTML = '<div class="lbl">Theme · adapter screen + this page</div>';
+      themes.forEach((t,i) => {
+        const el = document.createElement('div');
+        el.className = 'th' + (i === themeCur ? ' sel' : '');
+        el.innerHTML = '<span class="sw"><i style="background:'+t.c[0]+'"></i><i style="background:'+t.c[3]+
+          '"></i><i style="background:'+t.c[4]+'"></i><i style="background:'+t.c[5]+'"></i></span>'+esc(t.n);
+        el.onclick = (ev) => { ev.stopPropagation(); pickTheme(i); };
+        box.appendChild(el);
+      });
+    }
+
+    async function pickTheme(i){
+      applyTheme(i);                       /* instant on this page */
+      try{
+        const r = await fetch('/api/theme', {method:'POST', body:new URLSearchParams({i:String(i)})});
+        if (!r.ok) throw 0;
+        hint('Theme: ' + themes[i].n + ' (saved on the adapter)');
+      }catch(e){ hint('Could not save the theme'); }
+    }
+
+    async function loadThemes(){
+      try{
+        const r = await fetch('/api/themes', {cache:'no-store'});
+        if (!r.ok) return;
+        const d = await r.json();
+        themes = d.themes || [];
+        applyTheme(d.cur);
+      }catch(e){}
+    }
+
+    $('tbtn').onclick = (ev) => { ev.stopPropagation(); $('themes').classList.toggle('on'); };
+    document.addEventListener('click', () => $('themes').classList.remove('on'));
+
+    /* ---- game header (ESP32) ---- */
+    async function poll(){
+      try{
+        const r = await fetch('/api/state', {cache:'no-store'});
+        if (!r.ok) throw 0;
+        const d = await r.json();
+        setConn(true);
+        S = d;
+        $('rp').textContent = d.rp || '';
+        if (themes.length && d.theme !== themeCur) applyTheme(d.theme);
+        if (!d.gid) L = null;
+        else if (!L || L.gid !== d.gid) requestList();
+        render();
+      }catch(e){ setConn(false); }
+    }
+
+    /* ---- achievement list (Pico, via the ESP32 relay) ---- */
+    function requestList(){
+      if (!wsOK || !S.gid) return;
+      if (pend && Date.now() - listReqAt < 8000) return;   /* one is on its way */
+      listReqAt = Date.now();
+      listTimeout = false;
+      try{ ws.send('list'); }catch(e){}
+    }
+
+    /* AL=<idx>;<id>;<points>;<type>;<bucket>;<unlocked>;<unlock_time>;<rarity x100>;
+          <rarity_hc x100>;<measured %>;<flags>;<badge>;<measured>;<title>\t<description> */
+    function parseAL(s){
+      const f = [];
+      let k = 3;
+      for (let n = 0; n < 13; n++){
+        const j = s.indexOf(';', k);
+        if (j < 0) return null;
+        f.push(s.slice(k, j));
+        k = j + 1;
+      }
+      const rest = s.slice(k), tab = rest.indexOf('\t');
+      const ut = +f[6];
+      return { idx:+f[0], id:+f[1], p:+f[2], ty:+f[3], bk:+f[4], u:f[5] === '1',
+               ut: ut > 1e9 ? ut : 3e9 + ut,   /* unlocked this session (no clock on the Pico) */
+               r:+f[7]/100, rh:+f[8]/100, mp:+f[9], fl:+f[10], b:f[11], m:f[12],
+               t: tab < 0 ? rest : rest.slice(0, tab), d: tab < 0 ? '' : rest.slice(tab + 1) };
+    }
+
+    function handleListLine(s){
+      if (s.startsWith('ALH=')){
+        const h = s.slice(4).split(';').map(Number);
+        pend = { gid:h[0], n:h[1], hc:h[2], dropped:h[3]||0, stubbed:h[4]||0, items:[] };
+        render();
+      } else if (s.startsWith('AL=')){
+        if (!pend) return;
+        const a = parseAL(s);
+        if (a) pend.items.push(a);
+        if (pend.items.length % 10 === 0) render();
+      } else if (s.startsWith('ALE=')){
+        if (pend){ pend.items.sort((x,y) => x.idx - y.idx); L = pend; }
+        pend = null;
+        render();
+      }
+    }
+
+    const items = () => (L && L.gid === S.gid) ? L.items : [];
+    const isUnl = a => a.u;
+    const isChal = a => a.bk === BK_CHALLENGE;
+    const isBeat = a => a.ty === TY_PROG || a.ty === TY_WIN;
+    const offList = a => a.bk === BK_UNSUPPORTED || (a.fl & 1) === 1;
+    const inProg = a => !a.u && (a.mp > 0 || !!a.m);
+    function pctOf(a){
+      if (a.mp > 0) return Math.min(100, a.mp);
+      const x = /^\s*([\d.,]+)\s*\/\s*([\d.,]+)/.exec(a.m || '');
+      if (x){ const v = parseFloat(x[1].replace(/,/g,'')), t = parseFloat(x[2].replace(/,/g,'')); return t > 0 ? Math.min(100, v*100/t) : 0; }
+      const y = /([\d.]+)\s*%/.exec(a.m || '');
+      return y ? Math.min(100, parseFloat(y[1])) : 0;
+    }
+    const FILTERS = [
+      ['all',       'All',         a => true],
+      ['unlocked',  'Unlocked',    a => isUnl(a)],
+      ['beaten',    'Beaten',      a => isBeat(a)],
+      ['challenge', 'Challenges',  a => isChal(a)],
+      ['progress',  'In progress', a => inProg(a)],
+      ['locked',    'Locked',      a => !isUnl(a)],
+      ['off',       'Not tracked', a => offList(a)],
+    ];
+
+    /* unlocked first (newest first), then live challenges, then in progress
+       (closest to done), then the rest in set order; untracked last */
+    function rank(a){
+      if (isUnl(a)) return 0;
+      if (isChal(a)) return 1;
+      if (offList(a)) return 4;
+      if (inProg(a)) return 2;
+      return 3;
+    }
+    function sortList(list){
+      return list.map((a,i)=>[a,i]).sort((x,y)=>{
+        const a = x[0], b = y[0], r = rank(a) - rank(b);
+        if (r) return r;
+        if (rank(a) === 0 && a.ut !== b.ut) return b.ut - a.ut;
+        if (rank(a) === 2){ const d = pctOf(b) - pctOf(a); if (d) return d; }
+        return x[1] - y[1];
+      }).map(p => p[0]);
+    }
+
+    function render(){
+      const d = S, list = items(), have = list.length > 0;
+      $('title').textContent = d.title || (d.gid ? 'Game ' + d.gid : 'No game loaded');
+      $('sub').textContent = (d.st || '') + (d.gid ? ' · Game ID ' + d.gid : '');
+      const ra = $('ralink');
+      ra.hidden = !d.gid;
+      if (d.gid) ra.href = 'https://retroachievements.org/game/' + d.gid;
+      const mode = $('mode'), hc = L && L.gid === d.gid ? L.hc : -1;
+      mode.hidden = !(d.gid && hc >= 0);
+      mode.textContent = hc === 1 ? 'HARDCORE' : 'CASUAL';
+      mode.className = 'mode ' + (hc === 1 ? 'hc' : 'sc');
+      if (d.img && $('gimg').getAttribute('src') !== d.img) $('gimg').src = d.img;
+      if (!d.img) $('gimg').removeAttribute('src');
+
+      let total = d.total || 0, unlocked = d.unlocked || 0, pts = '–', beat = '–', beatDone = false;
+      if (have){
+        total = list.length;
+        unlocked = list.filter(isUnl).length;
+        const p = list.reduce((n,a) => n + a.p, 0), pu = list.filter(isUnl).reduce((n,a) => n + a.p, 0);
+        pts = pu + '/' + p;
+        /* RA "beaten": every progression achievement + a win condition (if the set has one) */
+        const pr = list.filter(a => a.ty === TY_PROG), wn = list.filter(a => a.ty === TY_WIN);
+        if (pr.length || wn.length){
+          beatDone = pr.every(isUnl) && (!wn.length || wn.some(isUnl));
+          beat = beatDone ? '✓' : (pr.filter(isUnl).length + (wn.some(isUnl) ? 1 : 0)) + '/' + (pr.length + (wn.length ? 1 : 0));
+        }
+      }
+      const pct = total ? Math.round(unlocked * 100 / total) : 0;
+      $('barfill').style.width = pct + '%';
+      $('barpct').textContent = pct + '%';
+      $('s-unlocked').textContent = unlocked + '/' + total;
+      $('s-points').textContent = pts;
+      $('s-beaten').textContent = beat;
+
+      const off = list.filter(offList).length;
+      $('setsum').innerHTML = !have ? '' :
+        '<span><b>' + unlocked + '/' + total + '</b> achievements</span>' +
+        '<span><b>' + pts + '</b> points</span>' +
+        (beatDone ? '<span class="beaten">✓ Beaten</span>' : beat !== '–' ? '<span>beaten: <b>' + beat + '</b></span>' : '') +
+        (off ? '<span>' + off + ' not tracked by the adapter</span>' : '');
+      /* achievements dropped for size (L.dropped) are reported only in the debug view */
+      renderTabs(have);
+      renderList(have);
+    }
+
+    function renderTabs(have){
+      const tabs = $('tabs');
+      tabs.innerHTML = '';
+      if (!have) return;
+      const list = items();
+      for (const [key,label,fn] of FILTERS){
+        const sub = list.filter(fn);
+        if ((key === 'beaten' || key === 'off') && !sub.length) continue;
+        const n = key === 'beaten' ? sub.filter(isUnl).length + '/' + sub.length : sub.length;
+        const el = document.createElement('div');
+        el.className = 'tab' + (filter === key ? ' sel' : '');
+        el.innerHTML = label + '<span class="n">' + n + '</span>';
+        el.onclick = () => { filter = key; renderTabs(true); renderList(true); };
+        tabs.appendChild(el);
+      }
+    }
+
+    function rareTxt(a){
+      const r = L && L.hc === 1 ? a.rh : a.r;
+      if (!r) return '';
+      return (r >= 10 ? Math.round(r) : r.toFixed(1)) + '% unlock rate';
+    }
+
+    function renderList(have){
+      const grid = $('grid');
+      if (!have){
+        grid.innerHTML = '<div class="soon">' + (
+          !S.gid ? 'No game running yet. Insert a cartridge and power the console on.' :
+          pend ? 'Loading the achievement list… ' + pend.items.length + '/' + pend.n :
+          listTimeout ? 'The adapter did not send the achievement list.' :
+          !wsOK ? 'Connecting…' :
+          (L && L.gid === S.gid) ? 'This game has no achievements.' : 'Loading the achievement list…') + '</div>';
+        return;
+      }
+      grid.innerHTML = '';
+      const fn = (FILTERS.find(f => f[0] === filter) || FILTERS[0])[2];
+      const list = sortList(items().filter(fn));
+      if (!list.length){
+        grid.innerHTML = '<div class="soon">No achievements here.</div>';
+        return;
+      }
+      for (const a of list){
+        const unlocked = isUnl(a), chal = isChal(a), pct = unlocked ? 0 : pctOf(a);
+        const div = document.createElement('div');
+        div.className = 'ach' + (unlocked ? '' : ' locked') + (chal ? ' challenge' : '') +
+          (!unlocked && progActive === a.id ? ' active' : '');
+        const img = a.b ? (BADGE + a.b + (unlocked ? '' : '_lock') + '.png') : '';
+        const rt = rareTxt(a);
+        div.innerHTML =
+          '<img src="' + esc(img) + '" loading="lazy" alt="" onerror="this.style.visibility=\'hidden\'">' +
+          '<div class="info">' +
+            '<div class="nm">' + esc(a.t) + '</div>' +
+            (a.d ? '<div class="ds">' + esc(a.d) + '</div>' : '') +
+            '<div class="meta">' +
+              '<span class="badge-pts">' + a.p + ' pts</span>' +
+              (chal ? '<span class="pill gold">CHALLENGE</span>' : '') +
+              (a.ty === TY_PROG ? '<span class="pill prog">Progression</span>' : '') +
+              (a.ty === TY_WIN  ? '<span class="pill win">Win condition</span>' : '') +
+              (a.ty === TY_MISS ? '<span class="pill miss">Missable</span>' : '') +
+              (offList(a) ? '<span class="pill off" title="The adapter cannot evaluate this one">Not tracked</span>' : '') +
+              (rt ? '<span class="pill">' + rt + '</span>' : '') +
+              (a.m && !unlocked ? '<span>' + esc(a.m) + '</span>' : '') +
+            '</div>' +
+            (pct > 0 && pct < 100 ? '<div class="pbar"><i style="width:' + pct + '%"></i></div>' : '') +
+          '</div>';
+        grid.appendChild(div);
+      }
+    }
+
+    /* ---- live push over WebSocket ---- */
+    let ws = null, wsOK = false, refreshT = null, lastMsg = 0, renderQ = false, progActive = 0;
+
+    function scheduleRefresh(ms){ clearTimeout(refreshT); refreshT = setTimeout(poll, ms || 400); }
+    function queueRender(){ if (renderQ) return; renderQ = true; requestAnimationFrame(() => { renderQ = false; render(); }); }
+    const find = id => items().find(a => a.id === id);
+
+    function beep(){
+      try{ const au = $('snd'); au.currentTime = 0; au.play().catch(()=>{}); }catch(e){}
+    }
+
+    function toastUnlock(m){
+      const a = find(m.id);
+      const title = m.t || (a && a.t) || ('Achievement ' + m.id);
+      const img = m.b || (a && a.b ? BADGE + a.b + '.png' : '');
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.innerHTML = (img ? '<img src="' + esc(img) + '" alt="" onerror="this.style.display=\'none\'">' : '') +
+        '<div><div class="tt">🏆 ACHIEVEMENT UNLOCKED</div><div class="tn">' + esc(title) + '</div></div>';
+      $('toasts').appendChild(el);
+      setTimeout(() => el.remove(), 5200);
+      beep();
+      try{ navigator.vibrate([120,60,120]); }catch(e){}
+      try{ if (window.Android) Android.notify('New Achievement Unlocked', (S.title ? S.title + ' - ' : '') + title); }catch(e){}
+    }
+
+    function handleEvt(m){
+      const a = m.id ? find(m.id) : null;
+      switch(m.e){
+        case 'unlock':
+          if (a){ a.u = true; a.ut = 5e9 + (++liveSeq); if (a.bk === BK_CHALLENGE) a.bk = 2; }
+          toastUnlock(m); queueRender(); scheduleRefresh(1500); break;
+        case 'challenge':
+          if (a) a.bk = m.show ? BK_CHALLENGE : (a.u ? 2 : 1);
+          else if (!m.show && !m.id) items().forEach(x => { if (x.bk === BK_CHALLENGE) x.bk = 1; });
+          queueRender(); break;
+        case 'progress':
+          if (m.show){ if (a){ a.m = m.m; a.mp = 0; } progActive = m.id; }
+          else if (progActive === m.id) progActive = 0;
+          queueRender(); break;
+        case 'rp':     $('rp').textContent = m.m || ''; S.rp = m.m; break;
+        case 'theme':  if (themes.length) applyTheme(m.i); else loadThemes(); break;
+        case 'reload': scheduleRefresh(300); break;
+        case 'list_timeout': pend = null; listTimeout = true; render(); break;
+      }
+    }
+
+    function wsConnect(){
+      try{ ws = new WebSocket('ws://' + location.host + '/ws'); }catch(e){ setTimeout(wsConnect, 3000); return; }
+      ws.onopen = () => { wsOK = true; lastMsg = Date.now(); pend = null; setConn(true); poll(); requestList(); };
+      ws.onmessage = (ev) => {
+        lastMsg = Date.now();
+        const s = ev.data;
+        if (s === 'pong') return;
+        if (s.charCodeAt(0) === 65 /* 'A': ALH= / AL= / ALE= */) { handleListLine(s); return; }
+        try{ handleEvt(JSON.parse(s)); }catch(e){}
+      };
+      ws.onclose = () => { wsOK = false; pend = null; setConn(false); setTimeout(wsConnect, 3000); };
+      ws.onerror = () => { try{ ws.close(); }catch(e){} };
+    }
+    /* heartbeat: a phone that slept can leave a dead socket that never closes */
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastMsg > 25000){ try{ ws.close(); }catch(e){} return; }
+      try{ ws.send('ping'); }catch(e){}
+    }, 10000);
+    /* periodic resync with the Pico (progress of achievements without an
+       on-screen indicator only shows up in a fresh list) */
+    setInterval(() => { if (!document.hidden) requestList(); }, 180000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden){ poll(); requestList(); } });
+
+    /* ---- hidden debug view: tap the game image 10x ---- */
+    const DBG_TAPS = 10;
+    let taps = 0, tapT = null, hintEl = null;
+    let dbgOn = false, dbgTimer = null, logView = 'live', hasLog = true;
+    let livePos = 0, liveText = '', bootText = '';
+    const LIVE_MAX = 200000;
+    const WIFI_REASON = {2:'auth expired',4:'assoc expired',8:'left AP',15:'4-way handshake timeout',
+      200:'beacon timeout',201:'AP not found',202:'auth failed',203:'assoc failed',
+      204:'handshake timeout',205:'connection failed'};
+
+    function hint(msg){
+      if (hintEl) hintEl.remove();
+      hintEl = document.createElement('div');
+      hintEl.className = 'hint';
+      hintEl.textContent = msg;
+      document.body.appendChild(hintEl);
+      const el = hintEl;
+      setTimeout(() => el.remove(), 1600);
+    }
+
+    $('gimg').addEventListener('click', () => {
+      clearTimeout(tapT);
+      tapT = setTimeout(() => { taps = 0; }, 1500);
+      if (dbgOn) { hint('Debug mode is already on'); return; }
+      taps++;
+      const left = DBG_TAPS - taps;
+      if (left <= 0) { taps = 0; setDbg(true); hint('Debug mode on'); }
+      else if (left <= 5) hint(left + (left === 1 ? ' tap' : ' taps') + ' away from debug mode');
+    });
+
+    function setDbg(on){
+      dbgOn = on;
+      try{ on ? localStorage.setItem('ra-dbg','1') : localStorage.removeItem('ra-dbg'); }catch(e){}
+      $('dbg').classList.toggle('on', on);
+      clearInterval(dbgTimer);
+      if (on) { dbgTick(); dbgTimer = setInterval(dbgTick, 2000); }
+    }
+
+    function fmtUp(s){
+      const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+      return (h ? h+'h ' : '') + (h||m ? m+'m ' : '') + (s%60) + 's';
+    }
+    function ago(s){ return s < 0 ? 'never' : fmtUp(s) + ' ago'; }
+    function kb(b){ return (b/1024).toFixed(1) + ' KB'; }
+
+    function renderDiag(d){
+      const rssiCls = !d.rssi ? 'bad' : d.rssi < -80 ? 'bad' : d.rssi < -70 ? 'warn' : '';
+      const rssiTxt = !d.rssi ? 'no signal' : d.rssi + ' dBm (' +
+        (d.rssi >= -60 ? 'good' : d.rssi >= -70 ? 'ok' : d.rssi >= -80 ? 'weak' : 'bad') + ')';
+      const li = items(), cur = L && L.gid === d.gid;
+      const rows = [
+        ['ESP32 firmware', d.fw + ' · board ' + d.board + ' · ' + d.cpu_mhz + ' MHz'],
+        ['Pico firmware', d.pico || '—'],
+        ['uptime', fmtUp(d.up_s)],
+        ['last reset', d.reset, /BROWNOUT|PANIC|WDT/.test(d.reset) ? 'bad' : ''],
+        ['boots since power-on', d.boots + (d.brownouts ? ' (' + d.brownouts + ' brownout)' : ''),
+          d.brownouts ? 'bad' : d.boots > 1 ? 'warn' : ''],
+        ['adapter state', d.st + ' (' + d.state + ')', d.state >= 198 ? 'bad' : ''],
+        ['game', d.gid ? d.gid + (cur ? ' · ' + (L.hc === 1 ? 'hardcore' : 'casual') : '') : '—'],
+        ['cartridge MD5', d.md5 || '—'],
+        ['achievements on the Pico', cur ? li.length + ' loaded · ' + li.filter(offList).length +
+          ' not tracked (' + L.stubbed + ' trigger too big) · ' + L.dropped + ' dropped (use esp32s3)' : '—',
+          cur && (L.dropped || L.stubbed) ? 'warn' : ''],
+        ['lists relayed', String(d.lists)],
+        ['Wi-Fi', (d.ssid || '—') + ' · ch ' + d.ch + ' · ' + d.ip],
+        ['RSSI', rssiTxt, rssiCls],
+        ['Wi-Fi drops', d.wifi_drops ? d.wifi_drops + ' · last: ' + d.wifi_last_reason + ' ' +
+          (WIFI_REASON[d.wifi_last_reason] || '') + ' · ' + ago(d.wifi_last_ago_s) : '0', d.wifi_drops ? 'warn' : ''],
+        ['RA request errors', d.http_errs ? d.http_errs + ' · last: ' + d.http_last + ' (' + d.http_last_code + ') · ' +
+          ago(d.http_last_ago_s) : '0', d.http_errs ? 'warn' : ''],
+        ['web clients', d.ws + ' live'],
+        ['heap', kb(d.heap) + ' (min ' + kb(d.heap_min) + ', blk ' + kb(d.heap_blk) + ')',
+          d.heap_min < 20480 ? 'bad' : d.heap_min < 40960 ? 'warn' : ''],
+        ...(d.psram ? [['PSRAM free', kb(d.psram)]] : []),
+        ...(d.log_cap ? [['log', kb(d.log_pos) + ' since boot · ring ' + kb(d.log_cap)]] : []),
+      ];
+      const kv = $('dbg-kv');
+      kv.innerHTML = '';
+      for (const [k, v, cls] of rows){
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.textContent = v == null ? '—' : v;
+        if (cls) dd.className = cls;
+        kv.append(dt, dd);
+      }
+      const br = $('opt-bright');
+      if (!brightTouched && d.bright){ br.value = d.bright; $('opt-bright-v').textContent = d.bright + '%'; }
+      hasLog = !!d.log_cap;
+      $('dbg-logbox').style.display = hasLog ? '' : 'none';
+      $('dbg-nolog').style.display = hasLog ? 'none' : '';
+    }
+
+    function showLog(){
+      const pre = $('dbg-log');
+      const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+      pre.textContent = logView === 'live' ? liveText : bootText;
+      if (logView === 'boot') return;
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+    }
+
+    async function dbgLog(){
+      if (!hasLog) return;
+      try{
+        const r = await fetch('/api/log?from=' + livePos, {cache:'no-store'});
+        if (!r.ok) return;
+        const start = +r.headers.get('X-Log-Start'), pos = +r.headers.get('X-Log-Pos');
+        const txt = await r.text();
+        if (pos < livePos) liveText = '\n··· adapter rebooted ···\n';
+        else if (start > livePos && livePos === 0) liveText = '··· older lines rolled off (see Boot log) ···\n';
+        else if (start > livePos) liveText += '\n··· ' + (start - livePos) + ' bytes lost ···\n';
+        liveText += txt;
+        if (liveText.length > LIVE_MAX) liveText = liveText.slice(-LIVE_MAX);
+        livePos = pos;
+        if (logView === 'live') showLog();
+        if (pos - start >= 8192) setTimeout(dbgLog, 100);   /* more waiting: catch up */
+      }catch(e){}
+    }
+
+    async function dbgTick(){
+      if (document.hidden) return;
+      try{
+        const r = await fetch('/api/diag', {cache:'no-store'});
+        if (r.ok) renderDiag(await r.json());
+      }catch(e){}
+      dbgLog();
+    }
+
+    async function loadBoot(){
+      try{
+        const r = await fetch('/api/log?boot=1', {cache:'no-store'});
+        if (r.ok) bootText = await r.text();
+      }catch(e){}
+    }
+
+    function selView(v){
+      logView = v;
+      $('dbg-live').classList.toggle('sel', v === 'live');
+      $('dbg-boot').classList.toggle('sel', v === 'boot');
+      showLog();
+    }
+
+    $('dbg-live').onclick = () => selView('live');
+    $('dbg-boot').onclick = async () => { await loadBoot(); selView('boot'); $('dbg-log').scrollTop = 0; };
+    $('dbg-copy').onclick = async () => {
+      const t = logView === 'live' ? liveText : bootText;
+      try{ await navigator.clipboard.writeText(t); hint('Log copied'); }
+      catch(e){
+        /* the clipboard API needs https on most browsers: select the text instead */
+        const sel = window.getSelection(), rg = document.createRange();
+        rg.selectNodeContents($('dbg-log')); sel.removeAllRanges(); sel.addRange(rg);
+        hint('Log selected — copy it from the menu');
+      }
+    };
+    $('dbg-save').onclick = () => {
+      const t = logView === 'live' ? liveText : bootText;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([t], {type:'text/plain'}));
+      a.download = 'snes-ra-' + logView + '-log.txt';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    };
+    $('dbg-off').onclick = () => { setDbg(false); hint('Debug mode off'); };
+
+    /* LCD brightness: sent when the slider is released (each change is saved
+       in the adapter EEPROM) */
+    let brightTouched = false;
+    $('opt-bright').oninput = (ev) => { brightTouched = true; $('opt-bright-v').textContent = ev.target.value + '%'; };
+    $('opt-bright').onchange = async (ev) => {
+      try{
+        const r = await fetch('/api/brightness', {method:'POST', body:new URLSearchParams({p:ev.target.value})});
+        if (!r.ok) throw 0;
+        hint('Brightness ' + ev.target.value + '% (saved on the adapter)');
+      }catch(e){ hint('Could not set the brightness'); }
+      brightTouched = false;
+    };
+    $('dbg-reboot').onclick = async () => {
+      if (!confirm('Reboot the adapter (ESP32 + Pico) now?\n\nThe RA session of a running game is lost: power the console off first.')) return;
+      try{
+        const r = await fetch('/api/reboot', {method:'POST'});
+        if (!r.ok) throw 0;
+        $('opt-msg').textContent = 'Rebooting… the page reconnects by itself.';
+      }catch(e){ $('opt-msg').textContent = 'Reboot request failed.'; }
+    };
+
+    try{ if (localStorage.getItem('ra-dbg') === '1') setDbg(true); }catch(e){}
+
+    loadThemes();
+    poll();
+    wsConnect();
+    /* the header is polled as a fallback / periodic reconcile: fast when the WS
+       is down, slow when it is delivering live events */
+    setInterval(() => { if (!wsOK) poll(); }, 2500);
+    setInterval(() => { if (wsOK)  poll(); }, 15000);
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  </script>
+</body>
+</html>

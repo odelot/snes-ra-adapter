@@ -1,7 +1,8 @@
 # snes-esp-firmware
 
-Fork of `nes-esp-firmware` adapted for the Super Nintendo adapter. Uses the
-**ESP32 C3 Super Mini** module. Responsibilities:
+Fork of `nes-esp-firmware` adapted for the Super Nintendo adapter. Builds for the
+**ESP32-C3 Super Mini** (prototype v0.1) or the **Waveshare ESP32-S3-Zero** (next revisions, still being validated),
+see [Board revisions](#board-revisions). Responsibilities:
 
 - Provides Internet connectivity to the SNES adapter.
 - Manages a TFT screen to display unlocked achievements.
@@ -18,30 +19,73 @@ Fork of `nes-esp-firmware` adapted for the Super Nintendo adapter. Uses the
   - Receive parsed header + ROM MD5 in a single `CART_INFO=...` message.
   - Send HTTP requests to RetroAchievements via `REQ=` / `RESP=` envelope.
 
-### Key differences vs `nes-esp-firmware`
+## Web portal
 
-| Aspect | NES | SNES |
-|---|---|---|
-| Cartridge ID | Pico sends 2× CRC32, ESP32 looks up `games.txt` (1971 entries) | Pico sends full `CART_INFO=` with MD5 already computed |
-| `games.txt` | required, ~80 KB on LittleFS | **removed** |
-| Console ID for RetroAchievements | inferred server-side from MD5 | inferred server-side from MD5 (no change) |
-| Bus isolation | ESP32 drives analog switches via `ANALOG_SWITCH_PIN` | **none** — Pico drives `BUFFER_OE_N` of 74HCT245 bank |
-| State `STATE_WAITING_CRC` | yes | renamed to `STATE_WAITING_CART_INFO` |
-| Command `READ_CRC` | yes | renamed to `READ_CART` (no payload back) |
-| Command `CRC_FOUND_MD5=` | yes | **removed** (MD5 comes inline in `CART_INFO=`) |
-| Command `NES_RESETED` | yes | renamed to `SNES_RESETED` |
-| Wi-Fi AP SSID | `NES_RA_ADAPTER` | `SNES_RA_ADAPTER` |
-| User-Agent | `NES_RA_ADAPTER/1.2 rcheevos/11.6` | `SNES_RA_ADAPTER/0.1 rcheevos/11.6` |
+With `ENABLE_INTERNAL_WEB_APP_SUPPORT` (on by default) the adapter serves a dashboard on the LAN at
+**http://snes-ra-adapter.local/** (or its IP, printed in the serial log). It is a port of the Wii RA
+Adapter dashboard:
+
+- game header (box art, RA link, hardcore/casual, rich presence, progress bar, points, "beaten");
+- the full achievement list with filters (unlocked, beaten, challenges, in progress, locked) — badges,
+  descriptions, points, progression / win condition / missable tags and unlock rate;
+- live updates over the WebSocket `/ws`: unlock toast with sound and vibration, challenge and progress
+  indicators, rich presence;
+- **theme switch** (🎨 in the header): the portal uses the colors of the LCD themes (`LcdTheme` in the
+  sketch, served by `/api/themes`, so a new theme shows up in both places). Picking one redraws the LCD
+  and saves it in the last EEPROM byte; a configuration reset (reset button) goes back to
+  `LCD_DEFAULT_THEME`;
+- **hidden debug view**: tap the game image 10 times. Shows reset reason, boot counter, heap, Wi-Fi,
+  RA request errors, etc
+
+The page lives in LittleFS. Edit the readable source **`web/index.html`**; what goes to LittleFS is the
+minified + gzipped build `data/index.html.gz` (~10 KB instead of ~37 KB; ESPAsyncWebServer serves it with
+`Content-Encoding: gzip`). Rebuild it after changing the page, then re-upload the `data` folder:
+
+```
+cd snes-esp-firmware/web
+npm install        # once (html-minifier-terser, pinned in package.json)
+npm run build      # web/index.html -> data/index.html.gz
+```
+
+`data/` must not contain an `index.html` (it would be served instead of the `.gz`; the build removes it). Pico and ESP32 firmwares must be updated together (an old Pico never answers
+`ACH_LIST`, and the page says so).
+
+| Endpoint | |
+|---|---|
+| `GET /api/state` | game header, rich presence, theme |
+| `WS /ws` | `list` / `ping` from the browser; list lines and live events to it |
+| `GET /api/themes`, `POST /api/theme` (`i=<index>`) | LCD themes / pick one |
+| `GET /api/diag`, `GET /api/log?from=N` (`?boot=1`), `POST /api/reboot`, `POST /api/brightness` (`p=10..100`) | debug view |
+| `GET /game` | sniff-mode game selector |
+
+The portal comes up once the game's patch has been forwarded to the Pico (or after an error), not at
+boot: until then the 48 KB patch buffer leaves the ESP32-C3 with too little heap to serve the page, and a
+browser could starve the TLS handshake of the patch download. Before the patch request the ESP32 also
+closes the TLS session left open by the login on retroachievements.org, for the same reason.
+
+The serial log of the debug view is kept only on boards with PSRAM (ESP32-S3, 32 KB ring + 8 KB boot
+capture); on the ESP32-C3 the RAM is needed for the patch download.
 
 ---
 
-## 🔧 How to Compile the Firmware for ESP32-C3 Super Mini  
+## Board revisions
+
+The firmware picks the board revision (`SNES_BOARD_REV`) from the chip selected in the IDE:
+
+| Rev | Board | Module | LCD (BLK/DC/RES/SDA/SCL) | LED G/R | Buzzer | Button | UART to Pico (TX/RX) |
+|---|---|---|---|---|---|---|---|
+| 1 | proto v0.1 | ESP32-C3 Super Mini | 7/1/0/4/2 | 5/6 | 10 | 8 | 21/20 (UART0 default) |
+| 2 | next revisions (not published yet) | Waveshare ESP32-S3-Zero | 7/8/9/10/11 | 13/1 | 12 | 2 | 5/4 (UART0 via GPIO matrix) |
+
+---
+
+## How to Compile the Firmware for ESP32-C3 Super Mini  
 
 This guide explains how to set up **Arduino IDE (version 2.3.4)** to compile and upload the firmware to an **ESP32-C3 Super Mini**.  
 
 ---
 
-### 📌 Prerequisites  
+### Prerequisites  
 
 1. **Download and install Arduino IDE (2.3.4)**  
    - Get it from: [https://www.arduino.cc/en/software](https://www.arduino.cc/en/software)  
@@ -68,15 +112,15 @@ This guide explains how to set up **Arduino IDE (version 2.3.4)** to compile and
 
 4. **Install the Arduino LittleFS Upload Plugin**
 
-   Visit the [plug-in site](https://github.com/earlephilhower/arduino-littlefs-upload) and follow its instructions. This is used to upload the contains of `data` folder (the CRC32<->MD5 map) to the LittleFS.
+   Visit the [plug-in site](https://github.com/earlephilhower/arduino-littlefs-upload) and follow its instructions. This is used to upload the contents of the `data` folder (the web portal page and its sound) to the LittleFS.
 
 ---
 
-### ⚙️ TFT_eSPI Library 
+### TFT_eSPI Library 
 
-Copy the files from `miscellaneus/TFT_eSPI_config` into the library folder (usually `/user/Documents/Arduino/libraries/TFT_eSPI`). It contains the user settings for the LCD we are using and also a bugfix for the version of the library we are using.
+Copy `misc/TFT_eSPI/User_Setup.h` (repo root) into the library folder (usually `/user/Documents/Arduino/libraries/TFT_eSPI`). It holds the LCD pins of both boards (ESP32-C3 and ESP32-S3, picked by `CONFIG_IDF_TARGET_ESP32S3`) and is the same file the NES RA adapter uses, so one copy serves both projects.
 
-### ⚙️ Configuring Arduino IDE for ESP32-C3  
+### Configuring Arduino IDE for ESP32-C3  
 
 Before compiling, adjust the settings in Arduino IDE:  
 
@@ -93,7 +137,7 @@ Before compiling, adjust the settings in Arduino IDE:
 
 ---
 
-### 🚀 Compiling and Uploading to ESP32-C3  
+### Compiling and Uploading to ESP32-C3  
 
 1. **Connect the ESP32-C3** to your PC via USB  
 2. **Select the correct port** under **Tools** → **Port**  
@@ -105,7 +149,7 @@ If everything is set up correctly, the firmware will be flashed, and the ESP32-C
 
 ---
 
-### ❓ Troubleshooting  
+### Troubleshooting  
 
 If you encounter issues:  
 - **Check the IDE console for errors** and ensure all required libraries are correctly installed.  

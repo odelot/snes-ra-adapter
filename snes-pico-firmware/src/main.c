@@ -77,13 +77,26 @@
 #define SNES_WR_N         26   // lado cart do U5 (Pico dirige no cart-ID)
 #define SNES_WRAM_N       27   // tap direto
 #define SNES_CART_N       28   // lado cart do U5
-#define SNES_RD_N         29   // lado cart do U5
 #define SNES_REFRESH_N    30   // tap direto (filtro de refresh no consumer)
 #define SNES_PAWR_N       31   // tap direto (strobe de escrita do B-bus)
 
 // --- Endereco alto (bancos; cart-ID + fase 4b) ---
 #define SNES_A17          32   // A17..A23 -> GP32..GP38
 #define SNES_A23          38
+
+// A22 no GP29 (dentro da janela do PIO0, lido por LOW_A22) e /RD no GP37:
+// protoboard de fios, placa v0.1 com os 2 jumpers e v0.4+. Comente para as
+// placas sem a troca (v0.1 original, v0.3): /RD no GP29 e A22 no GP37 --
+// o cart-ID funciona, mas a resolucao de bank da WRAM le o /RD como A22.
+#define A22_ON_GP29
+
+#ifdef A22_ON_GP29
+#define SNES_A22_PIN      29
+#define SNES_RD_N         37   // lado cart do U5 (so' o cart-ID usa)
+#else
+#define SNES_A22_PIN      37
+#define SNES_RD_N         29
+#endif
 
 // --- Taps do B-bus (decodificacao parcial: PA7=1 so em $2180-83) ---
 #define SNES_PA0          39
@@ -326,7 +339,7 @@ static void reset_bus_gpios(void) {
     // GP29 = A22 (re-soldado do slot 47). Pull-down para a auto-deteccao ler
     // 0 quando o fio nao existe (=> FALLBACK), em vez de flutuar e mentir 1.
     // Com o fio, o driver do console vence o pull (~50uA) com folga.
-    gpio_pull_down(SNES_RD_N);
+    gpio_pull_down(29);
 }
 
 /**
@@ -470,8 +483,9 @@ static void setup_bus_pios(void) {
 // Cartridge identification phase (runs on core 0 before monitor mode)
 // =============================================================================
 //
-// With BUFFER_OE_N held HIGH (buffers in HiZ) and SNES_RESET_DRIVE HIGH (SNES
-// stuck in reset), the cartridge bus is ours exclusively. We drive A0..A23,
+// With the bus isolated (switches open), the cartridge bus is ours
+// exclusively. /RESET is released while we read (MAD-1 carts gate the ROM on
+// it) and asserted again afterwards. We drive A0..A23,
 // /CART, /RD as outputs, sample D0..D7 as inputs, and walk the ROM space to
 // compute its MD5 hash and parse the SNES header.
 //
@@ -494,6 +508,13 @@ static inline void cart_release_pin(uint pin) {
     gpio_disable_pulls(pin);
 }
 
+// GPIO de cada linha de endereco A0..A23.
+static inline uint cart_addr_pin(uint bit) {
+    if (bit <= 16) return SNES_A0 + bit;
+    if (bit == 22) return SNES_A22_PIN;
+    return SNES_A17 + (bit - 17);
+}
+
 /**
  * Switch the cart-side GPIOs from input to output and stage them in the
  * "idle, no read active" state.
@@ -502,9 +523,20 @@ static inline void cart_release_pin(uint pin) {
  * is still isolated (BUFFER_OE_N high) and held in reset.
  */
 static void cart_drive_bus_acquire(void) {
-    // Address bus: A0..A16 em GP0..GP16 (contiguos), A17..A23 em GP32..GP38.
-    for (uint i = SNES_A0; i <= SNES_A16; i++) cart_drive_pin(i, 0);
-    for (uint i = SNES_A17; i <= SNES_A23; i++) cart_drive_pin(i, 0);
+    // Os pinos so' ganham funcao SIO no core1 (depois do cart-ID); ate' la'
+    // estao no estado de reset do RP2350 (funcao NULL, pad isolado) e nao
+    // dirigem nem leem nada.
+    reset_bus_gpios();
+
+    // Solta o /RESET durante a leitura: carts com MAD-1 (SRAM + bateria, ex.
+    // SMW) desligam a ROM com /RESET baixo. O console roda solto, mas segue
+    // isolado pelos switches; cart_drive_bus_release() volta a segura-lo.
+    gpio_put(SNES_RESET_DRIVE, 0);
+    sleep_ms(5);
+
+    // Address bus: A0..A16 em GP0..GP16 (contiguos), A17..A23 em GP32..GP38
+    // (com A22_ON_GP29, o A22 vai no GP29 e o GP37 e' o /RD).
+    for (uint bit = 0; bit < 24; bit++) cart_drive_pin(cart_addr_pin(bit), 0);
 
     // Data bus (D0..D7): inputs while we read. Pico is 5V-tolerant.
     for (uint i = SNES_D0; i <= SNES_D7; i++) cart_release_pin(i);
@@ -520,21 +552,27 @@ static void cart_drive_bus_acquire(void) {
  * Return all cart-side GPIOs to input/HiZ. The SNES is about to drive these.
  */
 static void cart_drive_bus_release(void) {
-    for (uint i = SNES_A0;  i <= SNES_A16; i++) cart_release_pin(i);
-    for (uint i = SNES_A17; i <= SNES_A23; i++) cart_release_pin(i);
+    for (uint bit = 0; bit < 24; bit++) cart_release_pin(cart_addr_pin(bit));
     for (uint i = SNES_D0;  i <= SNES_D7;  i++) cart_release_pin(i);
     cart_release_pin(SNES_CART_N);
     cart_release_pin(SNES_RD_N);
     cart_release_pin(SNES_WR_N);
+
+    gpio_put(SNES_RESET_DRIVE, 1);   // console preso de novo ate' release_snes()
 }
 
 // Bit-mask of address pins in the low SIO register (GP0..GP31).
-// A0..A16 ocupam GP0..GP16 -> 17 bits a partir do bit 0.
-#define ADDR_LO_MASK   ((1u << 17) - 1u)
-
+// A0..A16 ocupam GP0..GP16 -> 17 bits a partir do bit 0 (+ A22 no GP29).
 // Bit-mask of address pins in the high SIO register (GP32..GP47).
-// A17..A23 ocupam GP32..GP38 -> 7 bits a partir do bit 0 do registrador hi.
+// A17..A23 ocupam GP32..GP38 -> 7 bits a partir do bit 0 do registrador hi
+// (menos o GP37 quando ele e' o /RD).
+#ifdef A22_ON_GP29
+#define ADDR_LO_MASK   (((1u << 17) - 1u) | (1u << SNES_A22_PIN))
+#define ADDR_HI_MASK   (((1u << 7) - 1u) & ~(1u << 5))
+#else
+#define ADDR_LO_MASK   ((1u << 17) - 1u)
 #define ADDR_HI_MASK   ((1u << 7) - 1u)
+#endif
 
 /**
  * Drive a 24-bit address onto A0..A23 using atomic register writes.
@@ -544,6 +582,10 @@ static void cart_drive_bus_release(void) {
 static inline void cart_set_address(uint32_t addr) {
     uint32_t lo_bits = (addr & 0x1FFFFu);
     uint32_t hi_bits = ((addr >> 17) & 0x7Fu);
+#ifdef A22_ON_GP29
+    if (hi_bits & (1u << 5)) lo_bits |= 1u << SNES_A22_PIN;
+    hi_bits &= ~(1u << 5);
+#endif
 
     sio_hw->gpio_clr    = ADDR_LO_MASK;
     sio_hw->gpio_set    = lo_bits;
@@ -578,6 +620,58 @@ static uint8_t cart_read_byte(uint32_t addr) {
     gpio_put(SNES_CART_N, 1);
 
     return data;
+}
+
+static void cart_data_pulls(bool up, bool down) {
+    for (uint i = SNES_D0; i <= SNES_D7; i++) gpio_set_pulls(i, up, down);
+}
+
+/**
+ * Bench diagnostic (USB "CARTDIAG"): is the cart driving the data bus, and
+ * are any address lines shorted together? SNES must not be running.
+ */
+static void cart_diag(void) {
+    cart_drive_bus_acquire();
+    sleep_ms(1);
+
+    static const char *pull_name[] = {"pull-up", "pull-down"};
+    for (int pd = 0; pd < 2; pd++) {
+        cart_data_pulls(pd == 0, pd == 1);
+        sleep_us(50);
+        printf("[diag] $00:FFC0 (%s):", pull_name[pd]);
+        for (uint32_t a = 0x00FFC0u; a < 0x00FFE0u; a++) printf(" %02X", cart_read_byte(a));
+        uint32_t idle = (sio_hw->gpio_in >> SNES_D0) & 0xFFu;
+        printf(" | sem /RD: %02lX\n", (unsigned long)idle);
+    }
+
+    // Short test: drive one address line high (others low, /CART /RD high),
+    // pull-downs on D0-7, report any other bus pin that differs from the
+    // all-low baseline (which already has /CART /RD /WR high and any
+    // module pull-up, e.g. GP23 on the WeAct).
+    cart_data_pulls(false, true);
+    uint64_t bus = (0xFFull << SNES_D0) | (1ull << SNES_CART_N) |
+                   (1ull << SNES_RD_N) | (1ull << SNES_WR_N);
+    for (uint bit = 0; bit < 24; bit++) bus |= 1ull << cart_addr_pin(bit);
+    cart_set_address(0);
+    sleep_us(20);
+    uint64_t base = gpio_get_all64() & bus;
+    int bad = 0;
+    for (uint bit = 0; bit < 24; bit++) {
+        cart_set_address(1u << bit);
+        sleep_us(20);
+        uint64_t got = gpio_get_all64() & bus;
+        uint64_t exp = base | (1ull << cart_addr_pin(bit));
+        if (got != exp) {
+            printf("[diag] A%u alto (GP%u): GPIOs diferentes do esperado: %012llX\n",
+                   bit, cart_addr_pin(bit), (unsigned long long)(got ^ exp));
+            bad++;
+        }
+    }
+    cart_set_address(0);
+    printf("[diag] teste de curto nas linhas de endereco: %d problema(s)\n", bad);
+
+    cart_data_pulls(false, false);
+    cart_drive_bus_release();
 }
 
 // -----------------------------------------------------------------------------
@@ -747,32 +841,141 @@ static inline uint32_t bus_to_sram_offset(uint32_t bus_addr,
     }
 }
 
+// -----------------------------------------------------------------------------
+// ROMs de tamanho fora de potencia de 2 (10/12/20/24 Mbit)
+// -----------------------------------------------------------------------------
+//
+// O header arredonda o tamanho para cima (Super Metroid / FF3us: 24 Mbit ->
+// codigo 0x0C = 32 Mbit; Mega Man X: 12 Mbit -> 16). Na placa, o chip menor
+// nao decodifica as linhas altas e aparece espelhado na metade de cima: em
+// 24 Mbit (16+8), $300000-$3FFFFF repete $200000-$2FFFFF. O hash do RA e' do
+// dump SEM espelho (3 MB), entao: lemos o tamanho declarado inteiro, guardando
+// um hash por segmento de 32 KB e snapshots do estado MD5 nos possiveis pontos
+// de corte (S/2 + S/4, S/2 + S/8, ...); no fim, se a metade de cima for um
+// bloco menor repetido, finalizamos o MD5 a partir do snapshot do corte.
+// Custo: zero leitura extra.
+
+#define ROM_SEG_SHIFT  15u                               // 32 KB
+#define ROM_SEG_SIZE   (1u << ROM_SEG_SHIFT)
+#define ROM_MAX_SEGS   ((8u << 20) >> ROM_SEG_SHIFT)     // header ate' 64 Mbit
+#define ROM_MAX_SNAPS  10u                               // corte ate' S/2 + 2^24
+
+typedef struct {
+    uint32_t hash;      // FNV-1a do segmento
+    uint8_t  fill;      // primeiro byte (vale p/ o segmento todo se uniform)
+    bool     uniform;   // segmento inteiro com um unico valor (00/FF de padding)
+} rom_seg_t;
+
+static rom_seg_t   rom_segs[ROM_MAX_SEGS];
+static md5_state_t rom_md5_snaps[ROM_MAX_SNAPS];
+
+/**
+ * Tamanho real (em segmentos) de uma ROM lida com o tamanho declarado de
+ * nseg segmentos (potencia de 2). Se a metade de cima for um bloco de B
+ * segmentos repetido (B < nseg/2, o menor que fecha), a ROM real tem
+ * nseg/2 + B. Bloco de preenchimento constante nao conta como espelho
+ * (seria padding de verdade no dump).
+ */
+static uint32_t rom_mirror_real_segs(const rom_seg_t *seg, uint32_t nseg) {
+    if (nseg < 4 || (nseg & (nseg - 1)) != 0) return nseg;
+    uint32_t half = nseg / 2;
+    const rom_seg_t *up = &seg[half];
+
+    uint32_t best = half;
+    for (uint32_t b = half / 2; b >= 1; b /= 2) {
+        bool rep = true;
+        for (uint32_t k = b; k < half && rep; k++)
+            rep = up[k].hash == up[k % b].hash;
+        if (!rep) break;
+        best = b;
+    }
+    if (best == half) return nseg;
+
+    bool all_fill = true;
+    for (uint32_t k = 0; k < best && all_fill; k++)
+        all_fill = up[k].uniform && up[k].fill == up[0].fill;
+    if (all_fill) return nseg;
+
+    return half + best;
+}
+
 /**
  * Stream-MD5 the full ROM image, translating each linear offset to a bus
  * address according to the mapper. Reads in chunks to amortise the MD5
- * function call overhead.
+ * function call overhead. Detecta o espelho de ROMs fora de potencia de 2
+ * (ver acima) e devolve o tamanho real hasheado; *out_sum recebe a soma de
+ * 16 bits de tudo que foi lido (= checksum do header, que a Nintendo calcula
+ * sobre a imagem ja' espelhada).
  */
-static void cart_compute_md5(bool is_hirom, uint32_t rom_size_bytes,
-                             uint8_t out_md5[16]) {
+static uint32_t cart_compute_md5(bool is_hirom, uint32_t rom_size_bytes,
+                                 uint8_t out_md5[16], uint16_t *out_sum) {
     md5_state_t ctx;
     md5_init(&ctx);
 
-    enum { CHUNK = 256 };
+    enum { CHUNK = 256 };   // divide ROM_SEG_SIZE: um chunk nunca cruza segmento
     uint8_t chunk[CHUNK];
+
+    uint32_t nseg = rom_size_bytes >> ROM_SEG_SHIFT;
+    bool track = (rom_size_bytes & (ROM_SEG_SIZE - 1u)) == 0 &&
+                 nseg >= 4 && nseg <= ROM_MAX_SEGS &&
+                 (nseg & (nseg - 1)) == 0;
+    uint32_t half = rom_size_bytes / 2;
+    uint16_t sum  = 0;
 
     uint32_t offset = 0;
     while (offset < rom_size_bytes) {
         uint32_t to_read = rom_size_bytes - offset;
         if (to_read > CHUNK) to_read = CHUNK;
 
+        // Ponto de corte candidato (half + 2^k): guarda o MD5 ate' aqui.
+        if (track && offset > half) {
+            uint32_t d = offset - half;
+            if ((d & (d - 1)) == 0 && d >= ROM_SEG_SIZE) {
+                uint32_t idx = (uint32_t)__builtin_ctz(d) - ROM_SEG_SHIFT;
+                if (idx < ROM_MAX_SNAPS) rom_md5_snaps[idx] = ctx;
+            }
+        }
+
         for (uint32_t i = 0; i < to_read; i++) {
             uint32_t bus_addr = rom_offset_to_bus(is_hirom, offset + i);
             chunk[i] = cart_read_byte(bus_addr);
         }
+
+        if (track) {
+            rom_seg_t *s = &rom_segs[offset >> ROM_SEG_SHIFT];
+            uint32_t h = s->hash;
+            if ((offset & (ROM_SEG_SIZE - 1u)) == 0) {
+                h = 2166136261u;
+                s->fill = chunk[0];
+                s->uniform = true;
+            }
+            for (uint32_t i = 0; i < to_read; i++) {
+                h = (h ^ chunk[i]) * 16777619u;
+                if (chunk[i] != s->fill) s->uniform = false;
+            }
+            s->hash = h;
+        }
+        for (uint32_t i = 0; i < to_read; i++) sum = (uint16_t)(sum + chunk[i]);
+
         md5_append(&ctx, chunk, (int)to_read);
         offset += to_read;
     }
+    *out_sum = sum;
+
+    uint32_t real_bytes = rom_size_bytes;
+    if (track) {
+        uint32_t real_segs = rom_mirror_real_segs(rom_segs, nseg);
+        if (real_segs < nseg) {
+            uint32_t d   = (real_segs << ROM_SEG_SHIFT) - half;
+            uint32_t idx = (uint32_t)__builtin_ctz(d) - ROM_SEG_SHIFT;
+            if (idx < ROM_MAX_SNAPS) {
+                ctx = rom_md5_snaps[idx];
+                real_bytes = real_segs << ROM_SEG_SHIFT;
+            }
+        }
+    }
     md5_finish(&ctx, out_md5);
+    return real_bytes;
 }
 
 // -----------------------------------------------------------------------------
@@ -788,7 +991,7 @@ static void cart_compute_md5(bool is_hirom, uint32_t rom_size_bytes,
 // ESP32) grava o indice e reinicia. Persistencia no ultimo setor da flash.
 // Comente SNIFF_ONLY_MODE para voltar ao cart-ID real (fase 5).
 //
-#define SNIFF_ONLY_MODE 1
+// #define SNIFF_ONLY_MODE 1
 
 #ifdef SNIFF_ONLY_MODE
 
@@ -961,9 +1164,22 @@ static bool cart_id_phase(void) {
     // --- Streaming MD5 over the full ROM ---
     if (cart_info.rom_size_bytes > 0) {
         absolute_time_t t0 = get_absolute_time();
-        cart_compute_md5(cart_info.is_hirom, cart_info.rom_size_bytes,
-                         cart_info.md5);
+        uint16_t sum = 0;
+        uint32_t declared = cart_info.rom_size_bytes;
+        cart_info.rom_size_bytes = cart_compute_md5(cart_info.is_hirom, declared,
+                                                    cart_info.md5, &sum);
         int64_t elapsed_ms = absolute_time_diff_us(t0, get_absolute_time()) / 1000;
+
+        if (cart_info.rom_size_bytes != declared) {
+            printf("cart_id: espelho detectado -- ROM real %luKB (header %luKB)\n",
+                   (unsigned long)(cart_info.rom_size_bytes / 1024),
+                   (unsigned long)(declared / 1024));
+        }
+        // Soma lida x checksum do header: diverge = leitura ruim (ou mapper
+        // que o rom_offset_to_bus nao cobre, ex. ExHiROM / chips especiais).
+        printf("cart_id: checksum lido=%04X header=%04X (%s)\n",
+               sum, cart_info.checksum,
+               sum == cart_info.checksum ? "ok" : "DIVERGE");
 
         printf("cart_id: MD5=");
         for (int i = 0; i < 16; i++) printf("%02x", cart_info.md5[i]);
@@ -1013,6 +1229,15 @@ static void release_snes(void) {
 //     C=H;<id>                           challenge indicator hide
 //     REQ=<id>;M:<method>;U:<url>;D:<body>   HTTP request via ESP32
 //     BUFFER_OVERFLOW                    serial buffer wrapped
+//     ALH=<game_id>;<count>;<hardcore>;<lambda_dropped>;<stubbed>
+//                                        achievement list header (ACH_LIST=0)
+//     AL=<idx>;<id>;<points>;<type>;<bucket>;<unlocked>;<unlock_time>;
+//        <rarity x100>;<rarity_hc x100>;<measured %>;<flags>;<badge>;
+//        <measured>;<title>\t<description>
+//                                        one achievement (flags bit0 = trigger
+//                                        stubbed by filter_large_memaddr)
+//     ALN=<next_idx>                     chunk done, ask for the next one
+//     ALE=<count>                        list done
 //
 //   ESP32 -> Pico
 //     SYNC                               handshake ping
@@ -1020,6 +1245,9 @@ static void release_snes(void) {
 //     READ_CART                          trigger cart-ID phase
 //     START_WATCH                        login + load_game, then start monitor
 //     RESP=<id>;<http_code>;<body>       HTTP response
+//     ACH_LIST=<from_idx>                achievement list for the web portal,
+//                                        AL_CHUNK lines per request (the ESP32
+//                                        asks for the next chunk on ALN=)
 //     RESET                              force Pico reboot via watchdog
 
 #define BAUD_RATE          115200
@@ -1040,6 +1268,25 @@ static uint8_t *serial_buffer_head = serial_buffer;
 // todo o resto.
 #define MAX_MEMADDR_LEN 4096
 
+// Achievements cujo trigger foi stubado (o portal web os mostra como "nao
+// rastreados") e quantos o lambda descartou para caber no orcamento do patch
+// ("DroppedAchievements", so com &full=1).
+#define STUB_IDS_MAX 32
+static uint32_t stub_ids[STUB_IDS_MAX];
+static uint8_t  stub_ids_n;
+static uint16_t lambda_dropped;
+
+// ID do objeto de achievement dono do MemAddr em `at`: no JSON do RA / lambda
+// a chave "ID" vem antes de "MemAddr" no mesmo objeto. 0 se nao achar.
+static uint32_t ach_id_before(const char *json, const char *at) {
+    for (const char *q = at - 1; q > json; q--) {
+        if (*q == '{') break;
+        if (*q == '"' && strncmp(q, "\"ID\":", 5) == 0)
+            return (uint32_t)strtoul(q + 5, NULL, 10);
+    }
+    return 0;
+}
+
 /**
  * Varre o JSON do patch e substitui valores de "MemAddr" maiores que
  * MAX_MEMADDR_LEN por "1=0", deslocando o restante in-place.
@@ -1049,6 +1296,7 @@ static size_t filter_large_memaddr(char *json, size_t len) {
     const char  *needle = "\"MemAddr\":\"";
     const size_t needle_len = 11;
     char *pos = json;
+    stub_ids_n = 0;
 
     for (;;) {
         char *found = strstr(pos, needle);
@@ -1068,6 +1316,8 @@ static size_t filter_large_memaddr(char *json, size_t len) {
         if (v_len > MAX_MEMADDR_LEN) {
             printf("[filter] MemAddr de %u bytes -> stub 1=0\n",
                    (unsigned)v_len);
+            uint32_t stub_id = ach_id_before(json, found);
+            if (stub_id && stub_ids_n < STUB_IDS_MAX) stub_ids[stub_ids_n++] = stub_id;
             memmove(v_start + 3, v_end, (size_t)(json_end - v_end) + 1);
             memcpy(v_start, "1=0", 3);
             len -= (v_len - 3);
@@ -1087,10 +1337,57 @@ static inline bool prefix(const char *pre, const char *str) {
 // (CART_INFO, GAME_INFO, A=..., REQ=... visiveis num terminal no WeAct).
 #define MIRROR_UART_TO_USB 1
 
+// Imprime no USB trocando os valores de t= e p= (token/senha) por "***".
+static void usb_print_masked(const char *s) {
+    for (size_t i = 0; s[i]; ) {
+        bool start = (i == 0 || s[i - 1] == '&' || s[i - 1] == '?' ||
+                      s[i - 1] == ';' || s[i - 1] == ':');
+        if (start && (s[i] == 't' || s[i] == 'p') && s[i + 1] == '=') {
+            printf("%c=***", s[i]);
+            i += 2;
+            while (s[i] && s[i] != '&' && s[i] != ';' && s[i] != '\r' && s[i] != '\n') i++;
+            continue;
+        }
+        putchar_raw(s[i++]);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Fila de TX nao bloqueante (lista de achievements do portal web)
+// -----------------------------------------------------------------------------
+// uart_send() bloqueia ~87us/byte a 115200; uma linha AL= de ~300 bytes
+// seguraria o core0 ~26ms (frames perdidos). As linhas da lista entram nesta
+// fila e saem um FIFO por vez a cada volta do loop principal (al_tx_pump).
+// uart_send() esvazia a fila antes de escrever, para nunca intercalar linhas.
+
+static char     al_tx[1024];
+static uint16_t al_tx_len, al_tx_pos;
+
+static void al_tx_pump(void) {
+    while (al_tx_pos < al_tx_len && uart_is_writable(UART_ID))
+        uart_putc_raw(UART_ID, al_tx[al_tx_pos++]);
+    if (al_tx_pos >= al_tx_len) al_tx_pos = al_tx_len = 0;
+}
+
+static void al_tx_flush(void) {
+    while (al_tx_pos < al_tx_len)
+        uart_putc_raw(UART_ID, al_tx[al_tx_pos++]);   // bloqueante
+    al_tx_pos = al_tx_len = 0;
+}
+
+static void al_tx_queue(const char *s) {
+    size_t n = strlen(s);
+    if (al_tx_len + n > sizeof(al_tx)) al_tx_flush();
+    if (n > sizeof(al_tx)) return;
+    memcpy(al_tx + al_tx_len, s, n);
+    al_tx_len += (uint16_t)n;
+}
+
 static inline void uart_send(const char *s) {
+    al_tx_flush();
     uart_puts(UART_ID, s);
 #if MIRROR_UART_TO_USB
-    printf("%s", s);
+    usb_print_masked(s);
 #endif
 }
 
@@ -1474,10 +1771,14 @@ static void on_load_game(int result, const char *error_message,
 
 // --- rcheevos client init / teardown ---
 
+// 1 = hardcore (hardware real); 0 = softcore, para testes sem afetar o
+// progresso hardcore da conta.
+#define RA_HARDCORE 0
+
 static void rcheevos_init(void) {
     g_client = rc_client_create(read_memory, server_call);
     rc_client_enable_logging(g_client, RC_CLIENT_LOG_LEVEL_INFO, log_message);
-    rc_client_set_hardcore_enabled(g_client, 1);   // real hardware = hardcore
+    rc_client_set_hardcore_enabled(g_client, RA_HARDCORE);
     rc_client_set_event_handler(g_client, event_handler);
     rc_client_set_get_time_millisecs_function(g_client, get_pico_millis);
     rc_client_get_user_agent_clause(g_client, rcheevos_userdata, sizeof(rcheevos_userdata));
@@ -1535,6 +1836,103 @@ static void drain_ach_fifo(void) {
 }
 
 // =============================================================================
+// Achievement list for the ESP32 web portal (ACH_LIST=<from>)
+// =============================================================================
+//
+// The ESP32 keeps nothing: it relays these lines to the browser over its
+// WebSocket. Everything comes straight from rc_client (unlock state, bucket,
+// measured progress of every achievement, rarity, type...), so the portal
+// always shows what the adapter really evaluates. Flow control: AL_CHUNK
+// lines per request, the ESP32 asks for the next chunk when it gets ALN=, so
+// its UART RX buffer never overflows; the lines leave through the
+// non-blocking al_tx queue, so the frame loop never waits on the UART.
+
+#define AL_MAX_IDS 400
+#define AL_CHUNK   2
+static uint32_t al_ids[AL_MAX_IDS];   // snapshot taken at ACH_LIST=0
+static uint16_t al_n;
+
+// One protocol field: tabs / line breaks become spaces, cut on a UTF-8
+// character boundary (the browser gets these bytes as a WebSocket text frame).
+static void al_field(char *dst, size_t cap, const char *s) {
+    size_t o = 0;
+    if (!s) s = "";
+    while (*s && o + 1 < cap) {
+        char c = *s++;
+        if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+        dst[o++] = c;
+    }
+    if (((uint8_t)*s & 0xC0) == 0x80) {           // cut inside a character
+        while (o > 0 && ((uint8_t)dst[o - 1] & 0xC0) == 0x80) o--;
+        if (o > 0) o--;                            // its lead byte
+    }
+    dst[o] = '\0';
+}
+
+static void al_send_item(uint16_t idx) {
+    const rc_client_achievement_t *a = rc_client_get_achievement_info(g_client, al_ids[idx]);
+    if (!a) return;
+    char title[100], desc[164], meas[24];
+    al_field(title, sizeof(title), a->title);
+    al_field(desc, sizeof(desc), a->description);
+    al_field(meas, sizeof(meas), a->measured_progress);
+    unsigned flags = 0;
+    for (uint8_t i = 0; i < stub_ids_n; i++)
+        if (stub_ids[i] == a->id) { flags |= 1u; break; }
+    char line[420];
+    snprintf(line, sizeof(line),
+             "AL=%u;%lu;%lu;%u;%u;%u;%lu;%u;%u;%u;%u;%s;%s;%s\t%s\r\n",
+             (unsigned)idx, (unsigned long)a->id, (unsigned long)a->points,
+             (unsigned)a->type, (unsigned)a->bucket,
+             a->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED ? 1u : 0u,
+             (unsigned long)a->unlock_time,
+             (unsigned)(a->rarity * 100.0f + 0.5f),
+             (unsigned)(a->rarity_hardcore * 100.0f + 0.5f),
+             (unsigned)(a->measured_percent + 0.5f), flags,
+             a->badge_name, meas, title, desc);
+    al_tx_queue(line);
+}
+
+static void handle_ach_list(const char *cmd) {
+    uint32_t from = (uint32_t)strtoul(cmd + 9, NULL, 10);   // "ACH_LIST="
+    const rc_client_game_t *game = (g_client && state == 8) ? rc_client_get_game_info(g_client) : NULL;
+    if (game && game->id == 0) game = NULL;
+    char line[96];
+
+    if (from == 0) {
+        al_n = 0;
+        if (game) {
+            rc_client_achievement_list_t *list = rc_client_create_achievement_list(
+                g_client, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
+                RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+            if (list) {
+                for (uint32_t b = 0; b < list->num_buckets; b++) {
+                    const rc_client_achievement_bucket_t *bk = &list->buckets[b];
+                    for (uint32_t i = 0; i < bk->num_achievements && al_n < AL_MAX_IDS; i++)
+                        al_ids[al_n++] = bk->achievements[i]->id;
+                }
+                rc_client_destroy_achievement_list(list);
+            }
+        }
+        snprintf(line, sizeof(line), "ALH=%lu;%u;%d;%u;%u\r\n",
+                 game ? (unsigned long)game->id : 0ul, (unsigned)al_n,
+                 game ? rc_client_get_hardcore_enabled(g_client) : 0,
+                 (unsigned)lambda_dropped, (unsigned)stub_ids_n);
+        al_tx_queue(line);
+        printf("[list] portal: %u achievements\n", (unsigned)al_n);
+    }
+    if (!game) al_n = 0;
+
+    uint32_t end = from + AL_CHUNK;
+    if (end > al_n) end = al_n;
+    for (uint32_t i = from; i < end; i++) al_send_item((uint16_t)i);
+
+    if (end < al_n) snprintf(line, sizeof(line), "ALN=%lu\r\n", (unsigned long)end);
+    else            snprintf(line, sizeof(line), "ALE=%u\r\n", (unsigned)al_n);
+    al_tx_queue(line);
+}
+
+// =============================================================================
 // Cart-info announcement (sent right after cart_id_phase completes)
 // =============================================================================
 
@@ -1588,6 +1986,9 @@ static void handle_resp(const char *cmd) {
     // antes do parse (protege a heap) e mede o custo real do rcheevos.
     bool big = body_len > 8192;
     if (big) {
+        // quantos achievements o lambda descartou para caber (portal web)
+        const char *dr = strstr(p, "\"DroppedAchievements\":");
+        lambda_dropped = dr ? (uint16_t)strtoul(dr + 22, NULL, 10) : 0;
         // o buffer subjacente e' o serial_buffer (mutavel); o const vem
         // so da assinatura do handler
         body_len = filter_large_memaddr((char *)p, body_len);
@@ -1632,7 +2033,7 @@ static void handle_token_and_user(const char *cmd) {
     memcpy(ra_token, p, token_len);
     memcpy(ra_user,  comma + 1, user_len);
 
-    printf("creds: user=%s token=%.4s...\n", ra_user, ra_token);
+    printf("creds: user=%s token=%s\n", ra_user, ra_token[0] ? "***" : "(vazio)");
 }
 
 // =============================================================================
@@ -2603,7 +3004,20 @@ static void process_serial_command(char *command) {
             state = 5;
         }
 
+    } else if (prefix("ACH_LIST=", command)) {
+        handle_ach_list(command);
+
     } else if (prefix("SYNC", command)) {
+        // O ESP32 so' manda SYNC no proprio boot. Fora do estado 0 ele
+        // reiniciou sozinho (botao RST, Pico mantido pela USB): reinicia
+        // tambem, sem responder -- o ESP32 da' timeout, manda RESET e
+        // re-sincroniza com o Pico recem-ligado (console isolado e em reset).
+        if (state != 0) {
+            printf("[sync] ESP32 reiniciou com estado=%u -> reiniciando o Pico\n",
+                   (unsigned)state);
+            sleep_ms(20);
+            watchdog_reboot(0, 0, 0);
+        }
         uart_send("SYNC_ACK\r\n");
 
     } else if (prefix("PEEK=", command)) {
@@ -2677,6 +3091,10 @@ static void process_serial_command(char *command) {
                    (unsigned long)(SNIFF_GAME_COUNT - 1));
         }
 #endif
+
+    } else if (prefix("CARTDIAG", command)) {
+        if (state <= 2) cart_diag();
+        else printf("[diag] so com o SNES parado (estado <= 2)\n");
 
     } else if (prefix("RESETSNES", command)) {
         // Reset forcado do CONSOLE via Q1 (GP44 -> R2 -> base). No chicote
@@ -2805,6 +3223,7 @@ int main(void) {
 
     while (true) {
         poll_uart();
+        al_tx_pump();          // lista de achievements do portal (nao bloqueante)
         poll_usb_commands();   // mesmo protocolo via USB (bring-up sem ESP32)
         maybe_print_usb_banner();
         maybe_watch();         // WATCH=<addr>: imprime mudancas no espelho
