@@ -1,0 +1,12 @@
+{
+  "name": "snes-ra-adapter-web",
+  "private": true,
+  "description": "Builds the web portal page: web/index.html (readable source) -> data/index.html.gz (minified + gzip, uploaded to LittleFS)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "html-minifier-terser": "7.2.0"
+  }
+}

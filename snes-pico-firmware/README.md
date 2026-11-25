@@ -1,236 +1,171 @@
-# SNES-RA-Adapter — Pico Firmware (RP2350B)
+# snes-pico-firmware
 
-Firmware do Raspberry Pi Pico 2 (RP2350B, QFN-80 com 48 GPIOs) para o adaptador
-RetroAchievements do Super Nintendo. Baseado na arquitetura validada do
-[`nes-pico-firmware`](../nes-pico-firmware), com as adaptações necessárias para
-o barramento mais largo, clock mais rápido e WRAM de 128KB do SNES.
+Firmware for the **RP2350B** (WeAct Studio RP2350B Core Board, 48 GPIO) of the SNES RetroAchievements Adapter. It reads and identifies the cartridge, then listens to the console bus, keeps a copy of the memory and runs [rcheevos](https://github.com/RetroAchievements/rcheevos) to evaluate the achievements. All Internet traffic and the screen are handled by the ESP32 ([snes-esp-firmware](../snes-esp-firmware)), connected over UART.
 
-> **Status:** v0.6-skeleton — fim-a-fim funcional **em estrutura**:
-> captura WRAM (PIO0 SM0 + DMA), **captura cart-writes para SRAM ≤32KB
-> LoROM / ≤8KB HiROM (PIO0 SM1 + DMA)**, identificação de cartucho com MD5
-> streaming + parse de header, protocolo serial com ESP32 (compatível NES),
-> cliente rcheevos + frame loop + discovery pass. Falta: PIO1 para SRAM
-> grande (Fase 4b) e bring-up em hardware real.
+It is based on the architecture of the [NES RA Adapter](https://github.com/odelot/nes-ra-adapter) `nes-pico-firmware`. It was adapted for the SNES: a wider bus (24-bit address), a faster clock and 128 KB of WRAM.
 
 ---
 
-## Visão geral da arquitetura
+## How it works
 
-| Bloco             | NES                          | SNES                                       |
-|-------------------|------------------------------|--------------------------------------------|
-| MCU               | Pico 1 (RP2040, 30 GPIOs)    | Pico 2 (RP2350B, **48 GPIOs**)             |
-| Largura captura   | 1 PIO, 32 bits               | **2 PIOs, 32 bits cada**                   |
-| Address bus       | 16 bits (A0–A15)             | 24 bits (A0–A23)                           |
-| Shadow RAM        | 2KB WRAM + 8KB SRAM          | **128KB WRAM** + até 128KB SRAM            |
-| Clock CPU alvo    | 1.79 MHz (NTSC)              | 3.58 MHz (fast) / 2.68 MHz (slow)          |
-| Level shifter     | Necessário (5V)              | **Não usado** (RP2350 5V-tolerant nos IN)  |
-| ESP32 link        | UART 115200 8N1              | UART 115200 8N1 (idêntico)                 |
+### 1. Cartridge identification
 
-A grande mudança em relação ao NES é a **divisão da captura em dois PIOs**.
-No pinout v0.2, os sinais compartilhados (D0–D7, PHI2, /WR, /WRAM, /CART,
-/RD, /REFRESH, /PAWR) vivem na **janela de overlap GPIO 16–31**, visível
-tanto ao PIO0 (janela 0–31) quanto ao PIO1 (janela 16–47, via
-`pio_set_gpio_base(pio1, 16)`). Isso elimina os GPIOs duplicados da v0.1 e
-liberou pinos para os taps do B-bus (PA0/PA1/PA7, /PAWR, /PARD), que
-permitem rastrear a porta de WRAM `$2180–$2183` e detectar vblank real.
+At power-on the Pico:
 
----
+1. Holds the console in reset (`GP44` → Q1 → `/RESET`).
+2. Opens the bus switches (`GP45`), so the console is isolated from the cartridge.
+3. Drives A0–A23, /CART and /RD itself and reads the cartridge:
+   - It parses the internal header (title, LoROM/HiROM, ROM/SRAM size, region).
+   - It computes the **MD5 of the whole ROM**, the same hash RetroAchievements uses for SNES ROM files. ROMs whose size is not a power of two (10/12/20/24 Mbit, e.g. Super Metroid, Mega Man X) show up mirrored on the bus, and the firmware detects that so the hash matches the real dump.
+4. Sends `CART_INFO=` (header + MD5) to the ESP32, closes the switches and releases the console.
 
-## Pinout v0.2 (RP2350B QFN-80)
+### 2. Bus capture (core 1)
 
-> Implementado no firmware **0.7-skeleton** (`main.c` + `snes-bus.pio`).
-> Fonte de verdade: `../snes-ra-adapter-pcb/docs/netlist.md`.
-> Build: `PICO_BOARD=solderparty_rp2350_stamp_xl` (RP2350B, 48 GPIOs —
-> `pico2` é RP2350A/30 GPIOs e não serve).
+The bus is sampled by PIO state machines, **one word per write cycle**, at a fixed point inside the data-valid window. A DMA channel streams each one into a ring buffer, and core 1 drains the rings and updates the mirrors.
 
-> Endereços/dados/sinais lidos do barramento do cartucho **sem level shifter
-> dedicado**: o RP2350 (stepping atual) é 5V-tolerant em entradas digitais;
-> saídas (modo identificação de cartucho) ficam em 3.3V, que as ROMs
-> interpretam como HIGH (premissa validada no adaptador NES).
-
-```
-GPIO  Função              Direção      Notas
-─────────────────────────────────────────────────────────────────────────
- 0-15 A0–A15              IN/OUT*      lado cart de U1/U2 (*OUT só no cart-ID)
- 16   A16                 IN/OUT*      lado cart de U3
- 17-24 D0–D7              IN           lado cart de U4 (CBT3245)
- 25   PHI2                IN           tap direto (sem buffer)
- 26   /WR                 IN/OUT*      lado cart de U5
- 27   /WRAM               IN           tap direto
- 28   /CART               IN/OUT*      lado cart de U5
- 29   /RD                 IN/OUT*      lado cart de U5
- 30   /REFRESH            IN           tap direto (anti-falso-write)
- 31   /PAWR               IN           tap direto (trigger $2180)
- 32-38 A17–A23            IN/OUT*      lado cart de U3 (fase 4b + cart-ID)
- 39   PA0                 IN           tap direto ┐ decodificação parcial
- 40   PA1                 IN           tap direto │ do B-bus: PA7=1 só em
- 41   PA7                 IN           tap direto ┘ $2180-83 (porta WRAM)
- 42   /PARD               IN           tap direto (increment do ponteiro)
- 43   /RESET              IN           tap direto (monitor)
- 44   RESET_DRIVE         OUT          → R2 → Q1 (segura console em reset)
- 45   BUFFER_OE_N         OUT          → /OE de U1..U5 (pull-up 10k)
- 46   UART0 TX            OUT          → ESP32 RX
- 47   UART0 RX            IN           ← ESP32 TX
-```
-
-### Janelas dos PIOs (sem sinais duplicados)
-
-- **PIO0**: `gpio_base=0`, janela GPIO 0–31. Word (bit = GPIO):
-  0–15 `A0–A15`, 16 `A16`, 17–24 `D0–D7`, 25 `PHI2`, 26 `/WR`, 27 `/WRAM`,
-  28 `/CART`, 29 `/RD`, 30 `/REFRESH`, 31 `/PAWR`.
-- **PIO1**: **`pio_set_gpio_base(pio1, 16)`** (obrigatório no RP2350B!),
-  janela GPIO 16–47. Word (bit = GPIO−16): 0 `A16`, 1–8 `D0–D7`, 9 `PHI2`,
-  10 `/WR`, 11 `/WRAM`, 12 `/CART`, 13 `/RD`, 14 `/REFRESH`, 15 `/PAWR`,
-  16–22 `A17–A23`, 23 `PA0`, 24 `PA1`, 25 `PA7`, 26 `/PARD`, 27 `/RESET`,
-  28–31 mascarar (RESET_DRIVE, /OE, UART).
-
-Os sinais compartilhados vivem na **janela de overlap 16–31**, então os dois
-PIOs condicionam a captura nos mesmos pinos físicos — sem IRQ inter-PIO e
-sem GPIOs duplicados (que a v0.1 usava e custavam 5 pinos).
-
-State machines previstas:
-
-| SM | Trigger | Função |
+| PIO / SM | Trigger | What it captures |
 |---|---|---|
-| PIO0 SM0 | /WRAM+/WR+PHI2 | escritas WRAM (A-bus) |
-| PIO0 SM1 | /CART+/WR+PHI2 | escritas SRAM do cart |
-| PIO1 SM0 | /PAWR (+PA7 no consumer) | porta WRAM $2180–83 (escritas via DMA/porta) |
-| PIO1 SM1 | /CART+/WR+PHI2 | A17–A23 p/ SRAM grande (fase 4b, pareada com PIO0 SM1) |
+| PIO0 SM0 | /WRAM + /WR + PHI2 | Writes to the console WRAM (A-bus) |
+| PIO0 SM1 | /CART + /WR + PHI2 | Writes to cartridge space (LoROM SRAM) |
+| PIO0 SM2 | /WR, /WRAM inactive | Writes to the $6000–7FFF window (HiROM SRAM) |
+| PIO1 SM0 | /PAWR | B-bus writes to the WRAM port $2180–$2183 (DMA into WRAM) |
 
-> **Captura 1-palavra-por-ciclo**: os programas PIO devem amostrar UMA vez
-> por ciclo de escrita (delay fixo após PHI2 subir, re-arma só depois de /WR
-> subir), em vez do flood-sampling herdado do NES. Isso corta ~8× o tráfego
-> de DMA (a causa do overflow na PoC) e permite parear PIO0 SM1 ↔ PIO1 SM1
-> palavra a palavra.
+- **Two PIOs, one window:** the RP2350B lets PIO1 see GPIO 16–47 (`pio_set_gpio_base(pio1, 16)`). The shared signals (D0–D7, PHI2, /WR, /WRAM, /CART…) live in the overlap window GPIO 16–31, so both PIOs see them on the same pins and no GPIO is duplicated.
+- **Mirrors:**
+  - The firmware keeps a full copy of the **128 KB WRAM** and up to **32 KB of cartridge SRAM**.
+  - A full copy (instead of tracking only some addresses) is needed for achievements that use AddAddress / pointers, because their targets are only known at runtime.
+  - Bank resolution: A22 (on GP29) tells a WRAM mirror access ($00–$3F:0000–1FFF) from a direct $7E/$7F access.
+- **WRAM port:** a lot of data reaches the WRAM through the $2180 port (for example DMA from ROM). That never puts the WRAM address on the A-bus, so the firmware keeps a shadow of the port pointer ($2181–$2183) and its auto-increment.
 
-### Por que UART em GP46/47
+### 3. Frames and achievements (core 0)
 
-O RP2350B oferece UART0 em várias opções (GP0/1, GP12/13, GP16/17, GP28/29,
-GP32/33, GP44/45, **GP46/47**). Escolhemos **GP46/47** porque:
+- **Frame pacing:** `rc_client_do_frame` runs on the **real vblank**. The firmware detects it as the burst of the OAM DMA (544 writes to $2104) that games run in the NMI handler. If no vblank arrives in 25 ms (menus, force-blank), a timer takes over. NTSC/PAL comes from the cartridge header.
+- **Atomic evaluation:** each frame is evaluated on a snapshot of the addresses rcheevos uses, so core 1 never changes a value in the middle of an evaluation.
+- **Console reset:** the `/RESET` line is monitored (`GP43`). When you press RESET on the console, the mirrors are cleared and `rc_client_reset()` runs, the same as an emulator does.
 
-1. Ficam **no extremo final** dos GPIOs, longe dos pinos de barramento.
-2. Estão na "função padrão" da página de UART do RP2350 — roteamento limpo.
-3. Mesmo caindo dentro da janela de captura do PIO1 (16–47), não causam
-   problema: são os 2 bits mais significativos da palavra, fáceis de mascarar.
+### rcheevos memory map
+
+```
+0x000000 – 0x01FFFF   WRAM  (128 KB, banks $7E/$7F)
+0x020000 – 0x027FFF   SRAM  (up to 32 KB)
+```
 
 ---
 
-## Mapa de memória rcheevos para SNES
-
-O backend RetroAchievements expõe o mapa de memória SNES como uma região
-linear. Nosso shadow buffer segue:
+## Pinout (prototype v0.1, after the mod)
 
 ```
-0x000000 – 0x01FFFF   WRAM   (128KB, banks 7E/7F)
-0x020000 – 0x03FFFF   SRAM   (até 128KB, varia por cartucho)
+GPIO   Signal          Notes
+──────────────────────────────────────────────────────────────────
+ 0-16  A0–A16          cartridge side of the switches (output only during cart ID)
+17-24  D0–D7           cartridge side of the switches
+ 25    PHI2            direct tap
+ 26    /WR             cartridge side
+ 27    /WRAM           direct tap
+ 28    /CART           cartridge side
+ 29    A22             cartridge side (v0.1 needs the mod; see hardware/README.md)
+ 30    /REFRESH        direct tap
+ 31    /PAWR           direct tap
+32-36  A17–A21         cartridge side
+ 37    /RD             cartridge side (only used during cart ID)
+ 38    A23             cartridge side
+39-41  PA0, PA1, PA7   direct taps (B-bus address, partial decode of $2180–83)
+ 42    /PARD           direct tap
+ 43    /RESET          monitor
+ 44    RESET_DRIVE     output → R2 → Q1 (holds the console in reset)
+ 45    BUS_CTRL        output → enable of all 74HC4066 (HIGH = connected)
+ 46    UART0 TX        → ESP32 RX
+ 47    UART0 RX        ← ESP32 TX
 ```
 
-A captura em A0–A16 dá o offset direto dentro da WRAM (os 128KB são
-endereçados linearmente pelo barramento físico — todos os mirrors de
-`$00:0000-$00:1FFF`, `$80:0000-$80:1FFF` etc. são transparentes para nós).
+The RP2350 inputs are 5 V tolerant, so the bus taps have no level shifter. The Pico only drives the cartridge (at 3.3 V) while the console is isolated.
 
-### Estratégia de alocação: hashmap esparso (bus_track)
-
-Em vez de espelhar 128 KB de WRAM + até 128 KB de SRAM, mantemos um único
-**hashmap open-addressed** que armazena apenas os endereços que o rcheevos
-pede. Um jogo típico do SNES tem 50–500 endereços únicos referenciados em
-achievements, então a tabela cabe folgada em ~8 KB.
-
-**Estrutura:**
-
-- Capacidade fixa: 2048 slots × 4 bytes = **8 KB total** (cobre WRAM + SRAM)
-- Cada slot é uma palavra de 32 bits empacotada:
-  - bits 19..0 : endereço linear rcheevos (20 bits)
-  - bits 27..20: byte de dado
-  - bit 28     : flag "ocupado" (palavra 0 = slot vazio)
-- Probing linear, hash de Knuth
-- Carga típica ~25%, sem rehash em runtime (capacidade fixa)
-
-**Concorrência sem locks:**
-
-- O caminho quente é uma única **store atômica de 32 bits** na slot encontrada
-  via probing — o RP2350 garante atomicidade de loads/stores alinhados de
-  32 bits entre core 0 e core 1
-- Produtor único (consumer no core 1) faz updates
-- Consumidor único (rcheevos no core 0) faz leituras
-- Inserção de novos endereços (`bus_track_add`) só acontece em fase de
-  game-load com o PIO pausado — não há concorrência insert × update
-
-**Custo de performance:**
-
-- Update do produtor: 1 probe médio (≈20 ciclos a 200 MHz = 100 ns)
-- Maioria das escritas SNES é em endereços **não** rastreados → terminam no
-  primeiro probe com hit em slot vazio (zero cost além do hash)
-- Pico estimado de tráfego WRAM ≈ 1M escritas/s → ~10% de CPU no core 1
-- Comparado a array flat (~3 ciclos por update), a penalidade é absorvida
-  pelo orçamento de tempo do ciclo do barramento (279 ns em fast mode)
-
-**O que ganhamos:**
-
-- ~250 KB de SRAM liberados para rcheevos state, buffers serial, stacks
-- Sem snapshot — rcheevos lê direto do hashmap; leituras byte-a-byte
-  são atômicas, e o próprio rcheevos é tolerante a estados intermediários
-  entre frames
-- Independente de SRAM size do cartucho (não precisa parsing do header
-  para alocar)
-
-**Trade-off aceito:** endereços não pré-registrados via `bus_track_add()`
-retornam 0. Isso é OK porque o rcheevos sempre registra os endereços que
-vai consultar durante a inicialização do achievement set.
+Full board connections: [hardware/docs/netlist.md](../hardware/docs/netlist.md).
 
 ---
 
-## Roadmap de desenvolvimento
+## Compile-time options (`src/main.c`)
 
-- [x] **Fase 0** — Pinout fechado, estrutura de pastas
-- [x] **Fase 1** — PIO0 + DMA ping-pong + consumer no core1, hashmap esparso concurrent-safe
-- [x] **Fase 2** — Identificação de cartucho: drive bus, MD5 streaming, parse de header LoROM/HiROM
-- [x] **Fase 3** — Protocolo serial ESP32 (compat NES) + rcheevos client + frame loop 60/50Hz
-- [x] **Fase 3.5** — `snes-esp-firmware` portado (READ_CART/CART_INFO + renames)
-- [x] **Fase 4a** — PIO0 SM1 + cart-write capture + `bus_to_sram_offset` (small SRAM: ≤32KB LoROM, ≤8KB HiROM)
-- [ ] **Fase 4b** — Habilitar PIO1 para recuperar A17–A23 (carts com SRAM grande: Star Ocean, Tales of Phantasia, Dragon Quest VI)
-- [x] **Fase 4.5** — Firmware no pinout v0.2 (`pio_set_gpio_base`, janela de
-      overlap, captura 1-palavra-por-ciclo, DMA ENDLESS+ring com drenagem
-      incremental, espelho integral 128K WRAM + 32K SRAM no lugar do hashmap)
-- [x] **Fase 4c** — Tracker da porta WRAM `$2180–83` via /PAWR+PA7/PA1/PA0
-      (PIO1 SM0), com ponteiro-sombra de `$2181–83` e auto-incremento
-- [ ] **Fase 4d** — Detecção de vblank real via B-bus (escritas `$21xx` no
-      NMI) p/ frame pacing e snapshots atômicos
-- [ ] **Fase 5** — Bring-up em hardware real (validar timing, ajustar busy_wait, medir DMA overrun, scope no ponto de amostragem)
-- [ ] **Fase 6** — ExHiROM e enhancement chips (SuperFX, SA-1, DSP)
+| Define | Default | Use |
+|---|---|---|
+| `A22_ON_GP29` | on | A22 on GP29 and /RD on GP37 (v0.1 **with** the mod, and later boards). Comment it out only for an unmodified v0.1. Cart ID still works, but WRAM bank resolution reads /RD as A22. |
+| `BUS_SWITCH_4066` | on | Bus switches are 74HC4066 (active-HIGH enable). Comment it out for boards with '245 / SN74CBT3245 switches (active-LOW `/OE`). |
+| `BUS_SWITCH_4066_OPEN_DRAIN` | off | Plan B for 4066 parts that don't close with a 3.3 V enable. Also move JP1 to 2-3 (pull-up to 5 V). |
+| `RA_HARDCORE` | 0 | 0 = casual (softcore) mode. |
+| `SNIFF_ONLY_MODE` | off | Bring-up mode for wires soldered straight to the console: no cart ID, the game is picked from a fixed list. |
+| `MIRROR_UART_TO_USB` | 1 | Copies all Pico → ESP32 traffic to the USB serial (credentials are masked). |
 
-## Bring-up / debug (sem ESP32)
+---
 
-O USB serial do WeAct aceita **o mesmo protocolo do link UART** (terminador
-`\n` ou `\r`), então dá para exercitar tudo num terminal, sem ESP32 montado:
+## Building
 
-- `READ_CART` — dispara a identificação do cartucho (header + MD5 no console)
-- `PEEK=<addr hex>` — lê um byte do espelho (endereço linear rcheevos:
-  `0x000000+` = WRAM, `0x020000+` = SRAM). Ex.: `PEEK=7E` não — use o
-  offset: vidas em `$7E:0DBE` → `PEEK=0DBE`
-- `SYNC` / `RESET` — handshake / reboot
-- Todo o tráfego Pico→ESP32 é espelhado no USB (`MIRROR_UART_TO_USB`)
-- Marcadores `!w` `!c` `!b` = backlog >3/4 no ring de captura (quase-overrun)
+Requirements:
 
-**Banco de 4066 (protoboard e PCB v0.3)**: `BUS_SWITCH_4066` já é o
-**default** no `main.c` — GP45 push-pull 3.3V, ativo-ALTO (4066 fecha com
-HIGH), R1 pull-down na PCB para failsafe de power-on. Se um lote de 4066
-não fechar com 3.3V (pior caso CD4066B: 3.5V): habilite
-`BUS_SWITCH_4066_OPEN_DRAIN` **e** troque R1 por pull-up de 10k ao 5V
-(obrigatório nessa variante — o GPIO só puxa LOW ou solta). Prefira
-74HC4066 (Vih 3.15V @ 5V). Hardware antigo com '245: comente o define.
+- [Pico SDK 2.x](https://github.com/raspberrypi/pico-sdk) (with RP2350 support)
+- Arm GNU toolchain
+- CMake ≥ 3.19
 
-## Build
+rcheevos v11.6.0 is downloaded by CMake.
 
-Pré-requisito: Pico SDK 2.x (com suporte a RP2350) em `PICO_SDK_PATH`.
+The `pico` preset in `CMakePresets.json` points to the SDK and toolchain paths of the author's machine (`C:\VSARM\...`). Change `PICO_SDK_PATH`, `toolchainFile` and `CMAKE_MAKE_PROGRAM` to match yours. The board is `solderparty_rp2350_stamp_xl`, a generic RP2350B (48 GPIO) definition that works for the WeAct board. Don't use `pico2`: that is the RP2350A, with 30 GPIO.
 
 ```sh
 cmake --preset pico
 cmake --build --preset build_pico
 ```
 
-Saída em `build_pico/src/snes-pico-firmware.uf2`.
+Output: `build_pico/src/snes-pico-firmware.uf2`.
 
-## Licença
+### Flashing
 
-GPL-3.0 — mesma do projeto NES.
+1. Hold the **BOOT** button of the WeAct board.
+2. Plug it into the computer over USB.
+3. A drive called `RP2350` appears. Copy `snes-pico-firmware.uf2` to it, and the board reboots by itself.
+
+Flash it with the board **out of the console**.
+
+### Unit tests (host)
+
+```sh
+cmake --preset unit_tests
+cmake --build --preset build_tests
+ctest --preset test_all
+```
+
+The tests cover the PIO word decoding, the capture consumers, the $2180 port tracker, the header parser and the address translation. They re-declare that logic because `main.c` depends on the Pico SDK, so keep them in sync with `src/main.c`.
+
+---
+
+## Debug console (USB serial)
+
+The WeAct USB serial accepts the same commands as the UART link (end lines with `\n` or `\r`), plus some debug commands. You can test the board without the ESP32:
+
+| Command | What it does |
+|---|---|
+| `SYNC` / `RESET` | Handshake / reboot the Pico |
+| `READ_CART` | Run cartridge identification (header + MD5 on the console) |
+| `DBG` | Report of the capture pipeline: wires → PIO → DMA → consumers, vblank, SRAM windows |
+| `PEEK=<addr hex>` | Read a byte from the mirror (rcheevos address: `0x000000+` WRAM, `0x020000+` SRAM) |
+| `WATCH=<addr hex>` / `WATCH=OFF` | Print a byte every time it changes |
+| `GREP=<addr hex>` / `GREP=OFF` | Count and show the captures that wrote to one address |
+| `VSYNC=ON` / `VSYNC=OFF` | Frame pacing by the detected vblank (default) or by a free-running timer |
+| `RESETSNES` | Pulse the console reset |
+| `GAME?` / `GAME=<n>` | List / pick a game (only in `SNIFF_ONLY_MODE`) |
+
+The serial protocol with the ESP32 is described in a comment in `src/main.c` (section *ESP32 serial protocol*).
+
+---
+
+## Known limitations
+
+- **SA-1 games** (Super Mario RPG, Kirby Super Star, Kirby's Dream Land 3…): the SA-1 runs the game from its own memory inside the cartridge, and that data never reaches the connector. This is a hardware limit.
+- **Super FX games** (Star Fox, Yoshi's Island) work, because the game state lives in the console WRAM.
+- **Cartridge SRAM:**
+  - Only LoROM SRAM up to 32 KB and HiROM SRAM up to 8 KB are tracked. Larger SRAM (Star Ocean, Tales of Phantasia, Dragon Quest VI) needs A17–A23 in the capture (PIO1 SM1, not enabled yet).
+  - The SRAM of LoROM + DSP boards (e.g. Super Mario Kart) is only mapped in `SNIFF_ONLY_MODE` for now.
+- **ExHiROM** and the other enhancement chips are untested.
+- **Flash carts** are not supported: the adapter would hash the flash cart's menu, not the game.
+
+## License
+
+GPL-3.0, the same as the NES project.
